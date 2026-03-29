@@ -35,6 +35,14 @@ jobs:
         env:
           ORACLE_WALLET_B64: ${{ secrets.ORACLE_WALLET_B64 }}
 
+      - name: Initialize Database Schema
+        run: python -m kalshicast schema
+        env:
+          ORACLE_WALLET_DIR: /home/runner/oracle_wallet
+          ORACLE_DSN: ${{ secrets.ORACLE_DSN }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}
+      
       - name: Run health check
         run: python -m kalshicast health
         env:
