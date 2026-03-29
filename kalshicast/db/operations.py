@@ -410,3 +410,727 @@ def load_all_params(conn: Any) -> dict[str, str]:
     with conn.cursor() as cur:
         cur.execute("SELECT PARAM_KEY, PARAM_VALUE FROM PARAMS")
         return {row[0]: row[1] for row in cur if row[1] is not None}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Forecast Errors — MERGE from FORECASTS_DAILY + OBSERVATIONS
+# ─────────────────────────────────────────────────────────────────────
+
+def build_forecast_errors_for_date(conn: Any, target_date: str) -> int:
+    """Populate FORECAST_ERRORS by joining forecasts with observations.
+
+    Unpivots HIGH/LOW into separate TARGET_TYPE rows.
+    Error = Forecast - Observed (positive = model too warm).
+    """
+    sql = """
+    MERGE /*+ NO_PARALLEL(tgt) */ INTO FORECAST_ERRORS tgt
+    USING (
+      WITH latest_fc AS (
+        SELECT d.RUN_ID, d.SOURCE_ID, d.STATION_ID, d.TARGET_DATE,
+               d.HIGH_F, d.LOW_F,
+               d.LEAD_HOURS_HIGH, d.LEAD_HOURS_LOW,
+               d.LEAD_BRACKET_HIGH, d.LEAD_BRACKET_LOW,
+               ROW_NUMBER() OVER (
+                 PARTITION BY d.STATION_ID, d.SOURCE_ID, d.TARGET_DATE
+                 ORDER BY fr.ISSUED_AT DESC
+               ) AS rn
+        FROM FORECASTS_DAILY d
+        JOIN FORECAST_RUNS fr ON fr.RUN_ID = d.RUN_ID
+        WHERE d.TARGET_DATE = TO_DATE(:target_date, 'YYYY-MM-DD')
+      ),
+      fc AS (SELECT * FROM latest_fc WHERE rn = 1),
+      obs AS (
+        SELECT STATION_ID, TARGET_DATE, OBSERVED_HIGH_F, OBSERVED_LOW_F
+        FROM OBSERVATIONS
+        WHERE TARGET_DATE = TO_DATE(:target_date, 'YYYY-MM-DD')
+      ),
+      high_rows AS (
+        SELECT fc.STATION_ID, fc.SOURCE_ID, fc.TARGET_DATE,
+               'HIGH' AS TARGET_TYPE,
+               fc.LEAD_BRACKET_HIGH AS LEAD_BRACKET,
+               fc.LEAD_HOURS_HIGH AS LEAD_HOURS,
+               fc.RUN_ID,
+               fc.HIGH_F AS F_RAW,
+               obs.OBSERVED_HIGH_F AS OBSERVED,
+               fc.HIGH_F - obs.OBSERVED_HIGH_F AS ERROR_RAW
+        FROM fc
+        JOIN obs ON obs.STATION_ID = fc.STATION_ID
+                AND obs.TARGET_DATE = fc.TARGET_DATE
+        WHERE fc.HIGH_F IS NOT NULL AND obs.OBSERVED_HIGH_F IS NOT NULL
+      ),
+      low_rows AS (
+        SELECT fc.STATION_ID, fc.SOURCE_ID, fc.TARGET_DATE,
+               'LOW' AS TARGET_TYPE,
+               fc.LEAD_BRACKET_LOW AS LEAD_BRACKET,
+               fc.LEAD_HOURS_LOW AS LEAD_HOURS,
+               fc.RUN_ID,
+               fc.LOW_F AS F_RAW,
+               obs.OBSERVED_LOW_F AS OBSERVED,
+               fc.LOW_F - obs.OBSERVED_LOW_F AS ERROR_RAW
+        FROM fc
+        JOIN obs ON obs.STATION_ID = fc.STATION_ID
+                AND obs.TARGET_DATE = fc.TARGET_DATE
+        WHERE fc.LOW_F IS NOT NULL AND obs.OBSERVED_LOW_F IS NOT NULL
+      ),
+      all_rows AS (
+        SELECT * FROM high_rows
+        UNION ALL
+        SELECT * FROM low_rows
+      )
+      SELECT STATION_ID, SOURCE_ID, TARGET_DATE, TARGET_TYPE,
+             LEAD_BRACKET, LEAD_HOURS, RUN_ID, F_RAW, OBSERVED, ERROR_RAW
+      FROM all_rows
+    ) src
+    ON (
+      tgt.STATION_ID  = src.STATION_ID
+      AND tgt.SOURCE_ID   = src.SOURCE_ID
+      AND tgt.TARGET_DATE  = src.TARGET_DATE
+      AND tgt.TARGET_TYPE  = src.TARGET_TYPE
+      AND tgt.LEAD_BRACKET = src.LEAD_BRACKET
+    )
+    WHEN MATCHED THEN UPDATE SET
+      tgt.LEAD_HOURS  = src.LEAD_HOURS,
+      tgt.RUN_ID      = src.RUN_ID,
+      tgt.F_RAW       = src.F_RAW,
+      tgt.OBSERVED    = src.OBSERVED,
+      tgt.ERROR_RAW   = src.ERROR_RAW
+    WHEN NOT MATCHED THEN INSERT (
+      STATION_ID, SOURCE_ID, TARGET_DATE, TARGET_TYPE,
+      LEAD_BRACKET, LEAD_HOURS, RUN_ID, F_RAW, OBSERVED, ERROR_RAW
+    ) VALUES (
+      src.STATION_ID, src.SOURCE_ID, src.TARGET_DATE, src.TARGET_TYPE,
+      src.LEAD_BRACKET, src.LEAD_HOURS, src.RUN_ID, src.F_RAW, src.OBSERVED, src.ERROR_RAW
+    )
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"target_date": str(target_date)})
+        return cur.rowcount or 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Dashboard Stats — rolling distributions
+# ─────────────────────────────────────────────────────────────────────
+
+def update_dashboard_stats(conn: Any, window_days: int) -> None:
+    """Recompute DASHBOARD_STATS from FORECAST_ERRORS for a given window."""
+    if window_days <= 0:
+        window_days = 1
+
+    sql = """
+    MERGE /*+ NO_PARALLEL(tgt) */ INTO DASHBOARD_STATS tgt
+    USING (
+      WITH errs AS (
+        SELECT STATION_ID, SOURCE_ID, TARGET_TYPE, LEAD_BRACKET,
+               ERROR_RAW AS err
+        FROM FORECAST_ERRORS
+        WHERE TARGET_DATE >= TRUNC(SYSDATE) - :window_days
+          AND ERROR_RAW IS NOT NULL
+      ),
+      agg AS (
+        SELECT STATION_ID, SOURCE_ID, TARGET_TYPE, LEAD_BRACKET,
+          COUNT(*)                                                   AS n,
+          AVG(err)                                                  AS bias,
+          AVG(ABS(err))                                             AS mae,
+          SQRT(AVG(err * err))                                      AS rmse_raw,
+          PERCENTILE_CONT(0.10) WITHIN GROUP (ORDER BY err)        AS p10,
+          PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY err)        AS p25,
+          PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY err)        AS p50,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY err)        AS p75,
+          PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY err)        AS p90
+        FROM errs
+        WHERE LEAD_BRACKET IS NOT NULL
+        GROUP BY STATION_ID, SOURCE_ID, TARGET_TYPE, LEAD_BRACKET
+      )
+      SELECT STATION_ID, SOURCE_ID, TARGET_TYPE, LEAD_BRACKET,
+             :window_days AS WINDOW_DAYS,
+             n, bias, mae, rmse_raw, p10, p25, p50, p75, p90,
+             SYSTIMESTAMP AS COMPUTED_AT
+      FROM agg
+    ) src
+    ON (
+      tgt.STATION_ID   = src.STATION_ID
+      AND tgt.SOURCE_ID    = src.SOURCE_ID
+      AND tgt.TARGET_TYPE  = src.TARGET_TYPE
+      AND tgt.LEAD_BRACKET = src.LEAD_BRACKET
+      AND tgt.WINDOW_DAYS  = src.WINDOW_DAYS
+    )
+    WHEN MATCHED THEN UPDATE SET
+      tgt.N          = src.n,
+      tgt.BIAS       = src.bias,
+      tgt.MAE        = src.mae,
+      tgt.RMSE_RAW   = src.rmse_raw,
+      tgt.P10        = src.p10,
+      tgt.P25        = src.p25,
+      tgt.P50        = src.p50,
+      tgt.P75        = src.p75,
+      tgt.P90        = src.p90,
+      tgt.COMPUTED_AT = src.COMPUTED_AT
+    WHEN NOT MATCHED THEN INSERT (
+      STATION_ID, SOURCE_ID, TARGET_TYPE, LEAD_BRACKET, WINDOW_DAYS,
+      N, BIAS, MAE, RMSE_RAW, P10, P25, P50, P75, P90, COMPUTED_AT
+    ) VALUES (
+      src.STATION_ID, src.SOURCE_ID, src.TARGET_TYPE, src.LEAD_BRACKET, src.WINDOW_DAYS,
+      src.n, src.bias, src.mae, src.rmse_raw, src.p10, src.p25, src.p50, src.p75, src.p90,
+      src.COMPUTED_AT
+    )
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"window_days": window_days})
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Kalman State — read / write
+# ─────────────────────────────────────────────────────────────────────
+
+def get_kalman_state(conn: Any, station_id: str, target_type: str) -> dict | None:
+    """Read current Kalman state for (station, type). Returns None if not initialized."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT B_K, U_K, Q_BASE, STATE_VERSION, TOP_MODEL_ID,
+                   LAST_OBSERVATION_DATE, LAST_UPDATED_UTC
+            FROM KALMAN_STATES
+            WHERE STATION_ID = :sid AND TARGET_TYPE = :tt
+        """, {"sid": station_id, "tt": target_type})
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "b_k": float(row[0]) if row[0] is not None else 0.0,
+        "u_k": float(row[1]) if row[1] is not None else 4.0,
+        "q_base": float(row[2]) if row[2] is not None else 0.0,
+        "state_version": int(row[3]) if row[3] is not None else 0,
+        "top_model_id": row[4],
+        "last_observation_date": row[5],
+        "last_updated_utc": row[6],
+    }
+
+
+def upsert_kalman_state(conn: Any, station_id: str, target_type: str, state: dict) -> None:
+    """MERGE into KALMAN_STATES."""
+    sql = """
+    MERGE /*+ NO_PARALLEL(tgt) */ INTO KALMAN_STATES tgt
+    USING DUAL
+    ON (tgt.STATION_ID = :sid AND tgt.TARGET_TYPE = :tt)
+    WHEN MATCHED THEN UPDATE SET
+      B_K                  = :b_k,
+      U_K                  = :u_k,
+      Q_BASE               = :q_base,
+      STATE_VERSION        = :sv,
+      TOP_MODEL_ID         = :tmid,
+      LAST_OBSERVATION_DATE = :lod,
+      LAST_UPDATED_UTC     = SYSTIMESTAMP
+    WHEN NOT MATCHED THEN INSERT (
+      STATION_ID, TARGET_TYPE, B_K, U_K, Q_BASE,
+      STATE_VERSION, TOP_MODEL_ID, LAST_OBSERVATION_DATE, LAST_UPDATED_UTC
+    ) VALUES (
+      :sid, :tt, :b_k, :u_k, :q_base,
+      :sv, :tmid, :lod, SYSTIMESTAMP
+    )
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "sid": station_id, "tt": target_type,
+            "b_k": state["b_k"], "u_k": state["u_k"],
+            "q_base": state.get("q_base", 0.0),
+            "sv": state["state_version"],
+            "tmid": state.get("top_model_id"),
+            "lod": state.get("last_observation_date"),
+        })
+
+
+def insert_kalman_history(conn: Any, row: dict) -> None:
+    """Append to KALMAN_HISTORY."""
+    sql = """
+    INSERT INTO KALMAN_HISTORY (
+      STATION_ID, TARGET_TYPE, PIPELINE_RUN_ID,
+      B_K, U_K, Q_K, R_K, K_K, EPSILON_K,
+      STATE_VERSION, IS_AMENDMENT
+    ) VALUES (
+      :sid, :tt, :run_id,
+      :b_k, :u_k, :q_k, :r_k, :k_k, :epsilon_k,
+      :sv, :is_amend
+    )
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "sid": row["station_id"], "tt": row["target_type"],
+            "run_id": row.get("pipeline_run_id"),
+            "b_k": row["b_k"], "u_k": row["u_k"],
+            "q_k": row.get("q_k"), "r_k": row.get("r_k"),
+            "k_k": row.get("k_k"), "epsilon_k": row.get("epsilon_k"),
+            "sv": row.get("state_version", 0),
+            "is_amend": 1 if row.get("is_amendment") else 0,
+        })
+
+
+def get_kalman_history(conn: Any, station_id: str, target_type: str,
+                       since_date: str) -> list[dict]:
+    """Read KALMAN_HISTORY since a given date for amendment replay."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT B_K, U_K, Q_K, R_K, K_K, EPSILON_K, STATE_VERSION, CREATED_AT
+            FROM KALMAN_HISTORY
+            WHERE STATION_ID = :sid AND TARGET_TYPE = :tt
+              AND CREATED_AT >= TO_DATE(:since, 'YYYY-MM-DD')
+            ORDER BY CREATED_AT
+        """, {"sid": station_id, "tt": target_type, "since": since_date})
+        rows = []
+        for r in cur:
+            rows.append({
+                "b_k": float(r[0]) if r[0] is not None else 0.0,
+                "u_k": float(r[1]) if r[1] is not None else 4.0,
+                "q_k": float(r[2]) if r[2] is not None else 0.0,
+                "r_k": float(r[3]) if r[3] is not None else 0.0,
+                "k_k": float(r[4]) if r[4] is not None else 0.0,
+                "epsilon_k": float(r[5]) if r[5] is not None else 0.0,
+                "state_version": int(r[6]) if r[6] is not None else 0,
+                "created_at": r[7],
+            })
+        return rows
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Ensemble State / Model Weights
+# ─────────────────────────────────────────────────────────────────────
+
+def upsert_ensemble_state(conn: Any, rows: list[dict]) -> int:
+    """MERGE into ENSEMBLE_STATE."""
+    if not rows:
+        return 0
+    import json
+    count = 0
+    for r in rows:
+        sql = """
+        MERGE /*+ NO_PARALLEL(tgt) */ INTO ENSEMBLE_STATE tgt
+        USING DUAL
+        ON (tgt.RUN_ID = :run_id AND tgt.STATION_ID = :sid
+            AND tgt.TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD') AND tgt.TARGET_TYPE = :tt)
+        WHEN MATCHED THEN UPDATE SET
+          F_TK_TOP      = :f_tk_top,
+          TOP_MODEL_ID  = :tmid,
+          F_BAR_TK      = :f_bar,
+          S_TK          = :s_tk,
+          S_WEIGHTED_TK = :s_w,
+          SIGMA_EFF     = :sigma_eff,
+          M_K           = :m_k,
+          WEIGHT_JSON   = :wj,
+          STALE_MODEL_IDS = :stale
+        WHEN NOT MATCHED THEN INSERT (
+          RUN_ID, STATION_ID, TARGET_DATE, TARGET_TYPE,
+          F_TK_TOP, TOP_MODEL_ID, F_BAR_TK, S_TK, S_WEIGHTED_TK,
+          SIGMA_EFF, M_K, WEIGHT_JSON, STALE_MODEL_IDS
+        ) VALUES (
+          :run_id, :sid, TO_DATE(:td, 'YYYY-MM-DD'), :tt,
+          :f_tk_top, :tmid, :f_bar, :s_tk, :s_w,
+          :sigma_eff, :m_k, :wj, :stale
+        )
+        """
+        wj = json.dumps(r["weight_json"]) if isinstance(r.get("weight_json"), (dict, list)) else r.get("weight_json")
+        with conn.cursor() as cur:
+            cur.execute(sql, {
+                "run_id": r["run_id"], "sid": r["station_id"],
+                "td": str(r["target_date"]), "tt": r["target_type"],
+                "f_tk_top": r.get("f_tk_top"), "tmid": r.get("top_model_id"),
+                "f_bar": r.get("f_bar_tk"), "s_tk": r.get("s_tk"),
+                "s_w": r.get("s_weighted_tk"), "sigma_eff": r.get("sigma_eff"),
+                "m_k": r.get("m_k"), "wj": wj,
+                "stale": r.get("stale_model_ids"),
+            })
+            count += 1
+    return count
+
+
+def upsert_model_weights(conn: Any, rows: list[dict]) -> int:
+    """Batch INSERT into MODEL_WEIGHTS (append per run)."""
+    if not rows:
+        return 0
+    sql = """
+    INSERT INTO MODEL_WEIGHTS (
+      RUN_ID, STATION_ID, SOURCE_ID, LEAD_BRACKET,
+      W_M, BSS_M, IS_STALE, STALE_DECAY_FACTOR
+    ) VALUES (
+      :run_id, :sid, :src_id, :lb,
+      :w_m, :bss_m, :is_stale, :decay
+    )
+    """
+    count = 0
+    with conn.cursor() as cur:
+        for r in rows:
+            cur.execute(sql, {
+                "run_id": r["run_id"], "sid": r["station_id"],
+                "src_id": r["source_id"], "lb": r.get("lead_bracket"),
+                "w_m": r.get("w_m"), "bss_m": r.get("bss_m"),
+                "is_stale": 1 if r.get("is_stale") else 0,
+                "decay": r.get("stale_decay_factor"),
+            })
+            count += 1
+    return count
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Forecast data reads for L2 processing
+# ─────────────────────────────────────────────────────────────────────
+
+def get_latest_forecasts_for_date(conn: Any, target_date: str) -> list[dict]:
+    """Get latest forecast per (station, source, target_date) with lead info."""
+    sql = """
+    SELECT d.STATION_ID, d.SOURCE_ID, d.TARGET_DATE,
+           d.HIGH_F, d.LOW_F,
+           d.LEAD_BRACKET_HIGH, d.LEAD_BRACKET_LOW,
+           d.LEAD_HOURS_HIGH, d.LEAD_HOURS_LOW,
+           fr.ISSUED_AT
+    FROM (
+      SELECT d2.*, ROW_NUMBER() OVER (
+        PARTITION BY d2.STATION_ID, d2.SOURCE_ID, d2.TARGET_DATE
+        ORDER BY fr2.ISSUED_AT DESC
+      ) AS rn
+      FROM FORECASTS_DAILY d2
+      JOIN FORECAST_RUNS fr2 ON fr2.RUN_ID = d2.RUN_ID
+      WHERE d2.TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD')
+    ) d
+    JOIN FORECAST_RUNS fr ON fr.RUN_ID = d.RUN_ID
+    WHERE d.rn = 1
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"td": str(target_date)})
+        cols = [c[0].lower() for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur]
+
+
+def get_forecast_errors_window(conn: Any, station_id: str, source_id: str | None,
+                                target_type: str, lead_bracket: str,
+                                window_days: int) -> list[dict]:
+    """Get forecast errors for sigma/skewness computation over a trailing window."""
+    if source_id:
+        sql = """
+        SELECT ERROR_RAW, ERROR_ADJUSTED, F_RAW, F_ADJUSTED, OBSERVED, TARGET_DATE
+        FROM FORECAST_ERRORS
+        WHERE STATION_ID = :sid AND SOURCE_ID = :src
+          AND TARGET_TYPE = :tt AND LEAD_BRACKET = :lb
+          AND TARGET_DATE >= TRUNC(SYSDATE) - :window
+        ORDER BY TARGET_DATE
+        """
+        bind = {"sid": station_id, "src": source_id, "tt": target_type,
+                "lb": lead_bracket, "window": window_days}
+    else:
+        sql = """
+        SELECT ERROR_RAW, ERROR_ADJUSTED, F_RAW, F_ADJUSTED, OBSERVED, TARGET_DATE, SOURCE_ID
+        FROM FORECAST_ERRORS
+        WHERE STATION_ID = :sid
+          AND TARGET_TYPE = :tt AND LEAD_BRACKET = :lb
+          AND TARGET_DATE >= TRUNC(SYSDATE) - :window
+        ORDER BY TARGET_DATE
+        """
+        bind = {"sid": station_id, "tt": target_type,
+                "lb": lead_bracket, "window": window_days}
+
+    with conn.cursor() as cur:
+        cur.execute(sql, bind)
+        cols = [c[0].lower() for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur]
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Shadow Book — write
+# ─────────────────────────────────────────────────────────────────────
+
+def upsert_shadow_book(conn: Any, rows: list[dict]) -> int:
+    """MERGE into SHADOW_BOOK on TICKER PK."""
+    if not rows:
+        return 0
+    sql = """
+    MERGE /*+ NO_PARALLEL(tgt) */ INTO SHADOW_BOOK tgt
+    USING DUAL
+    ON (tgt.TICKER = :ticker)
+    WHEN MATCHED THEN UPDATE SET
+      MU              = :mu,
+      SIGMA_EFF       = :sigma_eff,
+      G1_S            = :g1_s,
+      ALPHA_S         = :alpha_s,
+      XI_S            = :xi_s,
+      OMEGA_S         = :omega_s,
+      P_WIN           = :p_win,
+      METAR_TRUNCATED = :metar_trunc,
+      T_OBS_MAX       = :t_obs_max,
+      TOP_MODEL_ID    = :tmid,
+      PIPELINE_RUN_ID = :run_id,
+      UPDATED_AT      = SYSTIMESTAMP
+    WHEN NOT MATCHED THEN INSERT (
+      TICKER, STATION_ID, TARGET_DATE, TARGET_TYPE, BIN_LOWER, BIN_UPPER,
+      MU, SIGMA_EFF, G1_S, ALPHA_S, XI_S, OMEGA_S, P_WIN,
+      METAR_TRUNCATED, T_OBS_MAX, TOP_MODEL_ID, PIPELINE_RUN_ID
+    ) VALUES (
+      :ticker, :sid, TO_DATE(:td, 'YYYY-MM-DD'), :tt, :bin_lo, :bin_hi,
+      :mu, :sigma_eff, :g1_s, :alpha_s, :xi_s, :omega_s, :p_win,
+      :metar_trunc, :t_obs_max, :tmid, :run_id
+    )
+    """
+    count = 0
+    with conn.cursor() as cur:
+        for r in rows:
+            cur.execute(sql, {
+                "ticker": r["ticker"], "sid": r["station_id"],
+                "td": str(r["target_date"]), "tt": r["target_type"],
+                "bin_lo": r.get("bin_lower"), "bin_hi": r.get("bin_upper"),
+                "mu": r.get("mu"), "sigma_eff": r.get("sigma_eff"),
+                "g1_s": r.get("g1_s"), "alpha_s": r.get("alpha_s"),
+                "xi_s": r.get("xi_s"), "omega_s": r.get("omega_s"),
+                "p_win": r.get("p_win"),
+                "metar_trunc": 1 if r.get("metar_truncated") else 0,
+                "t_obs_max": r.get("t_obs_max"),
+                "tmid": r.get("top_model_id"), "run_id": r.get("pipeline_run_id"),
+            })
+            count += 1
+    return count
+
+
+def insert_shadow_book_history(conn: Any, rows: list[dict]) -> int:
+    """Append-only insert into SHADOW_BOOK_HISTORY."""
+    if not rows:
+        return 0
+    sql = """
+    INSERT INTO SHADOW_BOOK_HISTORY (TICKER, P_WIN, MU, SIGMA_EFF, PIPELINE_RUN_ID)
+    VALUES (:ticker, :p_win, :mu, :sigma_eff, :run_id)
+    """
+    count = 0
+    with conn.cursor() as cur:
+        for r in rows:
+            cur.execute(sql, {
+                "ticker": r["ticker"], "p_win": r.get("p_win"),
+                "mu": r.get("mu"), "sigma_eff": r.get("sigma_eff"),
+                "run_id": r.get("pipeline_run_id"),
+            })
+            count += 1
+    return count
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Brier Scores — grading
+# ─────────────────────────────────────────────────────────────────────
+
+def grade_brier_scores(conn: Any, target_date: str) -> int:
+    """Grade SHADOW_BOOK predictions against OBSERVATIONS → BRIER_SCORES.
+
+    For each ticker with target_date, determine outcome (1 if observed in bin, 0 else),
+    compute BS = (p_win - outcome)^2.
+    """
+    sql = """
+    MERGE /*+ NO_PARALLEL(tgt) */ INTO BRIER_SCORES tgt
+    USING (
+      SELECT sb.TICKER,
+             sb.P_WIN AS P_WIN_AT_GRADING,
+             CASE
+               WHEN sb.TARGET_TYPE = 'HIGH' AND
+                    obs.OBSERVED_HIGH_F >= sb.BIN_LOWER AND
+                    obs.OBSERVED_HIGH_F < sb.BIN_UPPER THEN 1
+               WHEN sb.TARGET_TYPE = 'LOW' AND
+                    obs.OBSERVED_LOW_F >= sb.BIN_LOWER AND
+                    obs.OBSERVED_LOW_F < sb.BIN_UPPER THEN 1
+               ELSE 0
+             END AS OUTCOME,
+             POWER(sb.P_WIN - CASE
+               WHEN sb.TARGET_TYPE = 'HIGH' AND
+                    obs.OBSERVED_HIGH_F >= sb.BIN_LOWER AND
+                    obs.OBSERVED_HIGH_F < sb.BIN_UPPER THEN 1
+               WHEN sb.TARGET_TYPE = 'LOW' AND
+                    obs.OBSERVED_LOW_F >= sb.BIN_LOWER AND
+                    obs.OBSERVED_LOW_F < sb.BIN_UPPER THEN 1
+               ELSE 0
+             END, 2) AS BRIER_SCORE
+      FROM SHADOW_BOOK sb
+      JOIN OBSERVATIONS obs
+        ON obs.STATION_ID = sb.STATION_ID
+       AND obs.TARGET_DATE = sb.TARGET_DATE
+      WHERE sb.TARGET_DATE = TO_DATE(:target_date, 'YYYY-MM-DD')
+        AND sb.P_WIN IS NOT NULL
+    ) src
+    ON (tgt.TICKER = src.TICKER)
+    WHEN MATCHED THEN UPDATE SET
+      tgt.P_WIN_AT_GRADING = src.P_WIN_AT_GRADING,
+      tgt.OUTCOME          = src.OUTCOME,
+      tgt.BRIER_SCORE      = src.BRIER_SCORE,
+      tgt.GRADED_AT        = SYSTIMESTAMP
+    WHEN NOT MATCHED THEN INSERT (
+      TICKER, P_WIN_AT_GRADING, OUTCOME, BRIER_SCORE
+    ) VALUES (
+      src.TICKER, src.P_WIN_AT_GRADING, src.OUTCOME, src.BRIER_SCORE
+    )
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"target_date": str(target_date)})
+        return cur.rowcount or 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# BSS Matrix — skill scoring
+# ─────────────────────────────────────────────────────────────────────
+
+def get_bss_for_cell(conn: Any, station_id: str, lead_bracket: str,
+                     target_type: str) -> dict | None:
+    """Read BSS for a single cell. Returns None if not computed yet."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT BSS_1, BSS_2, IS_QUALIFIED, N_OBSERVATIONS, BS_MODEL, BS_BASELINE_1
+            FROM BSS_MATRIX
+            WHERE STATION_ID = :sid AND LEAD_BRACKET = :lb AND TARGET_TYPE = :tt
+        """, {"sid": station_id, "lb": lead_bracket, "tt": target_type})
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "bss_1": float(row[0]) if row[0] is not None else None,
+        "bss_2": float(row[1]) if row[1] is not None else None,
+        "is_qualified": bool(row[2]),
+        "n_observations": int(row[3]) if row[3] is not None else 0,
+        "bs_model": float(row[4]) if row[4] is not None else None,
+        "bs_baseline_1": float(row[5]) if row[5] is not None else None,
+    }
+
+
+def get_bss_matrix_all(conn: Any) -> list[dict]:
+    """Read entire BSS_MATRIX for pattern analysis."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT STATION_ID, TARGET_TYPE, LEAD_BRACKET,
+                   BSS_1, BSS_2, IS_QUALIFIED, N_OBSERVATIONS
+            FROM BSS_MATRIX
+        """)
+        cols = [c[0].lower() for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur]
+
+
+def refresh_bss_matrix(conn: Any, window_days: int) -> int:
+    """Recompute BSS for all (station, target_type, lead_bracket) cells.
+
+    BSS_1 = 1 - BS_model / BS_clim (climatological baseline = uniform 1/N_bins).
+    Hysteresis is applied in Python after reading current IS_QUALIFIED.
+    """
+    sql = """
+    MERGE /*+ NO_PARALLEL(tgt) */ INTO BSS_MATRIX tgt
+    USING (
+      WITH graded AS (
+        SELECT sb.STATION_ID, sb.TARGET_TYPE,
+               COALESCE(fe.LEAD_BRACKET, 'h3') AS LEAD_BRACKET,
+               bs.BRIER_SCORE, bs.OUTCOME
+        FROM BRIER_SCORES bs
+        JOIN SHADOW_BOOK sb ON sb.TICKER = bs.TICKER
+        LEFT JOIN FORECAST_ERRORS fe
+          ON fe.STATION_ID = sb.STATION_ID
+         AND fe.TARGET_DATE = sb.TARGET_DATE
+         AND fe.TARGET_TYPE = sb.TARGET_TYPE
+        WHERE sb.TARGET_DATE >= TRUNC(SYSDATE) - :window
+          AND bs.BRIER_SCORE IS NOT NULL
+      ),
+      stats AS (
+        SELECT STATION_ID, TARGET_TYPE, LEAD_BRACKET,
+               COUNT(*)               AS n_obs,
+               AVG(BRIER_SCORE)       AS bs_model,
+               AVG(POWER(0.0667 - OUTCOME, 2)) AS bs_clim
+        FROM graded
+        GROUP BY STATION_ID, TARGET_TYPE, LEAD_BRACKET
+        HAVING COUNT(*) >= 10
+      )
+      SELECT STATION_ID, TARGET_TYPE, LEAD_BRACKET,
+             :window AS WINDOW_DAYS,
+             bs_model, bs_clim AS BS_BASELINE_1,
+             CASE WHEN bs_clim > 0 THEN 1.0 - bs_model / bs_clim ELSE NULL END AS BSS_1,
+             n_obs AS N_OBSERVATIONS,
+             SYSTIMESTAMP AS COMPUTED_AT
+      FROM stats
+    ) src
+    ON (
+      tgt.STATION_ID  = src.STATION_ID
+      AND tgt.TARGET_TYPE  = src.TARGET_TYPE
+      AND tgt.LEAD_BRACKET = src.LEAD_BRACKET
+    )
+    WHEN MATCHED THEN UPDATE SET
+      tgt.WINDOW_DAYS   = src.WINDOW_DAYS,
+      tgt.BS_MODEL      = src.bs_model,
+      tgt.BS_BASELINE_1 = src.BS_BASELINE_1,
+      tgt.BSS_1         = src.BSS_1,
+      tgt.N_OBSERVATIONS = src.N_OBSERVATIONS,
+      tgt.COMPUTED_AT   = src.COMPUTED_AT
+    WHEN NOT MATCHED THEN INSERT (
+      STATION_ID, TARGET_TYPE, LEAD_BRACKET, WINDOW_DAYS,
+      BS_MODEL, BS_BASELINE_1, BSS_1, N_OBSERVATIONS, COMPUTED_AT
+    ) VALUES (
+      src.STATION_ID, src.TARGET_TYPE, src.LEAD_BRACKET, src.WINDOW_DAYS,
+      src.bs_model, src.BS_BASELINE_1, src.BSS_1, src.N_OBSERVATIONS, src.COMPUTED_AT
+    )
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"window": window_days})
+        return cur.rowcount or 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Financial Metrics / System Alerts
+# ─────────────────────────────────────────────────────────────────────
+
+def upsert_financial_metrics(conn: Any, row: dict) -> None:
+    """MERGE into FINANCIAL_METRICS on METRIC_DATE PK."""
+    sql = """
+    MERGE /*+ NO_PARALLEL(tgt) */ INTO FINANCIAL_METRICS tgt
+    USING DUAL
+    ON (tgt.METRIC_DATE = TO_DATE(:md, 'YYYY-MM-DD'))
+    WHEN MATCHED THEN UPDATE SET
+      BANKROLL       = :bank,     PORTFOLIO_VALUE = :pv,
+      DAILY_PNL      = :dpnl,    CUMULATIVE_PNL  = :cpnl,
+      MDD_ALLTIME    = :mdd_all, MDD_ROLLING_90  = :mdd_90,
+      SR_DOLLAR      = :sr_d,    SR_SIMPLE       = :sr_s,
+      SHARPE_ROLLING_30 = :sr30, FDR             = :fdr,
+      EUR            = :eur,     CAL             = :cal,
+      MARKET_CAL     = :mcal,    N_BETS_TOTAL    = :nbt,
+      N_BETS_WON     = :nbw,    N_BETS_LOST     = :nbl,
+      GROSS_PROFIT   = :gp,     NET_PROFIT      = :np,
+      TOTAL_FEES     = :tf,     COMPUTED_AT     = SYSTIMESTAMP
+    WHEN NOT MATCHED THEN INSERT (
+      METRIC_DATE, BANKROLL, PORTFOLIO_VALUE, DAILY_PNL, CUMULATIVE_PNL,
+      MDD_ALLTIME, MDD_ROLLING_90, SR_DOLLAR, SR_SIMPLE, SHARPE_ROLLING_30,
+      FDR, EUR, CAL, MARKET_CAL,
+      N_BETS_TOTAL, N_BETS_WON, N_BETS_LOST,
+      GROSS_PROFIT, NET_PROFIT, TOTAL_FEES
+    ) VALUES (
+      TO_DATE(:md, 'YYYY-MM-DD'), :bank, :pv, :dpnl, :cpnl,
+      :mdd_all, :mdd_90, :sr_d, :sr_s, :sr30,
+      :fdr, :eur, :cal, :mcal,
+      :nbt, :nbw, :nbl,
+      :gp, :np, :tf
+    )
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "md": str(row["metric_date"]),
+            "bank": row.get("bankroll"), "pv": row.get("portfolio_value"),
+            "dpnl": row.get("daily_pnl"), "cpnl": row.get("cumulative_pnl"),
+            "mdd_all": row.get("mdd_alltime"), "mdd_90": row.get("mdd_rolling_90"),
+            "sr_d": row.get("sr_dollar"), "sr_s": row.get("sr_simple"),
+            "sr30": row.get("sharpe_rolling_30"), "fdr": row.get("fdr"),
+            "eur": row.get("eur"), "cal": row.get("cal"),
+            "mcal": row.get("market_cal"), "nbt": row.get("n_bets_total", 0),
+            "nbw": row.get("n_bets_won", 0), "nbl": row.get("n_bets_lost", 0),
+            "gp": row.get("gross_profit", 0), "np": row.get("net_profit", 0),
+            "tf": row.get("total_fees", 0),
+        })
+
+
+def insert_system_alert(conn: Any, alert: dict) -> None:
+    """Insert a new SYSTEM_ALERT."""
+    sql = """
+    INSERT INTO SYSTEM_ALERTS (
+      ALERT_ID, ALERT_TYPE, STATION_ID, SOURCE_ID,
+      SEVERITY_SCORE, DETAILS_JSON
+    ) VALUES (
+      :aid, :atype, :sid, :src_id, :sev, :details
+    )
+    """
+    import json
+    with conn.cursor() as cur:
+        cur.execute(sql, {
+            "aid": new_run_id(),
+            "atype": alert.get("alert_type"),
+            "sid": alert.get("station_id"),
+            "src_id": alert.get("source_id"),
+            "sev": alert.get("severity_score"),
+            "details": json.dumps(alert.get("details")) if alert.get("details") else None,
+        })

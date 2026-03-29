@@ -9,7 +9,7 @@ def main() -> None:
     args = sys.argv[1:]
     if not args:
         print("Usage: python -m kalshicast <command>")
-        print("Commands: morning, schema, observations")
+        print("Commands: morning, night, market_open, schema, observations")
         sys.exit(1)
 
     cmd = args[0].lower()
@@ -38,6 +38,14 @@ def main() -> None:
             conn.close()
             close_pool()
 
+    elif cmd == "night":
+        from kalshicast.pipeline.night import main as night_main
+        night_main()
+
+    elif cmd == "market_open":
+        from kalshicast.pipeline.market_open import main as market_open_main
+        market_open_main()
+
     elif cmd == "observations":
         from kalshicast.collection.collectors.collect_cli import fetch_observations
         from kalshicast.config import get_stations
@@ -50,7 +58,7 @@ def main() -> None:
 
     else:
         print(f"Unknown command: {cmd}")
-        print("Commands: morning, schema, observations")
+        print("Commands: morning, night, market_open, schema, observations")
         sys.exit(1)
 
 
