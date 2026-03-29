@@ -595,13 +595,13 @@ def seed_config_tables(conn: Any) -> None:
                     STATION_ID, CLI_SITE, NAME, CITY, STATE_CODE,
                     TIMEZONE, LAT, LON, ELEVATION_FT, WFO_ID, IS_ACTIVE
                 ) VALUES (
-                    :sid, :cli, :name, :city, :state,
+                    :sid, :cli, :st_name, :city, :st_state,
                     :tz, :lat, :lon, :elev, :wfo, :active
                 )
             """, {
                 "sid": s["station_id"], "cli": s.get("cli_site"),
-                "name": s.get("name"), "city": s.get("city"),
-                "state": s.get("state"), "tz": s.get("timezone"),
+                "st_name": s.get("name"), "city": s.get("city"),
+                "st_state": s.get("state"), "tz": s.get("timezone"),
                 "lat": s.get("lat"), "lon": s.get("lon"),
                 "elev": s.get("elevation_ft"), "wfo": s.get("wfo_id"),
                 "active": 1 if s.get("is_active") else 0,
@@ -617,18 +617,38 @@ def seed_config_tables(conn: Any) -> None:
                     SOURCE_ID, NAME, MODULE_PATH, FUNC_NAME,
                     PROVIDER_GROUP, PARAMS_JSON, IS_ENABLED, UPDATE_CYCLE_HOURS
                 ) VALUES (
-                    :sid, :name, :mod, :func,
+                    :sid, :src_name, :mod_path, :func,
                     :pg, :pj, :en, :uch
                 )
             """, {
-                "sid": src_id, "name": spec.get("name"),
-                "mod": spec.get("module"), "func": spec.get("func"),
+                "sid": src_id, "src_name": spec.get("name"),
+                "mod_path": spec.get("module"), "func": spec.get("func"),
                 "pg": spec.get("provider_group"),
                 "pj": json.dumps(spec.get("params")) if spec.get("params") else None,
                 "en": 1 if spec.get("enabled") else 0,
                 "uch": spec.get("update_cycle_hours"),
             })
 
+    # Seed PARAMS
+    for p in PARAM_DEFS:
+        with conn.cursor() as cur:
+            cur.execute("""
+                MERGE INTO PARAMS tgt USING DUAL
+                ON (tgt.PARAM_KEY = :pk)
+                WHEN NOT MATCHED THEN INSERT (
+                    PARAM_KEY, PARAM_VALUE, DTYPE, DESCRIPTION
+                ) VALUES (
+                    :pk, :pv, :dt, :desc_val
+                )
+            """, {
+                "pk": p.key, "pv": p.default,
+                "dt": p.dtype, "desc_val": p.description,
+            })
+
+    conn.commit()
+    log.info("Seeded %d stations, %d sources, %d params",
+             len(STATIONS), len(SOURCES), len(PARAM_DEFS))
+    
     # Seed PARAMS
     for p in PARAM_DEFS:
         with conn.cursor() as cur:
