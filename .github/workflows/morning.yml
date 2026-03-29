@@ -36,7 +36,13 @@ jobs:
       - name: Run morning pipeline
         run: python -m kalshicast morning
         env:
+          # Database Credentials
           ORACLE_WALLET_DIR: /home/runner/oracle_wallet
           ORACLE_DSN: ${{ secrets.ORACLE_DSN }}
           ORACLE_USER: ${{ secrets.ORACLE_USER }}
           ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}
+          
+          # Weather API Keys (Add these lines!)
+          VISUALCROSSING_KEY: ${{ secrets.VISUALCROSSING_KEY }}
+          TOMORROW_API_KEY: ${{ secrets.TOMORROW_API_KEY }}
+          WEATHERAPI_KEY: ${{ secrets.WEATHERAPI_KEY }}
