@@ -16,7 +16,7 @@ from kalshicast.config.params_bootstrap import get_param_int, get_param_float
 from kalshicast.db.operations import (
     get_or_create_observation_run,
     upsert_observation,
-    upsert_location,
+    upsert_station,
 )
 from kalshicast.db.connection import get_conn
 
@@ -367,7 +367,7 @@ def fetch_observations_for_station(*, conn, run_id, station: dict, target_date: 
     station_id = station["station_id"]
 
     try:
-        upsert_location(
+        upsert_station(
             {
                 "station_id": station_id,
                 "name": station.get("name"),
