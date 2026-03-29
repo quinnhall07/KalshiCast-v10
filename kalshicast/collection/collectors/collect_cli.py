@@ -469,9 +469,16 @@ def _fetch_worker(run_id: str, station: dict, target_date: str) -> bool:
         conn.close()
 
 def fetch_observations(stations: list, target_date: str) -> bool:
-    # 1. Create the run exactly like your old code
+    # 1. Create the run exactly like your old code, but with a database connection
     run_issued_at = f"{target_date}T12:00:00Z"
-    run_id = get_or_create_observation_run(run_issued_at=run_issued_at)
+    
+    # Grab a temporary connection just to create the run ID
+    conn = get_conn()
+    try:
+        run_id = get_or_create_observation_run(conn=conn, run_issued_at=run_issued_at)
+        conn.commit()
+    finally:
+        conn.close()
 
     any_ok = False
 
