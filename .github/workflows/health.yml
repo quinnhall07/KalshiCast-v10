@@ -24,16 +24,16 @@ jobs:
 
       - name: Configure Oracle wallet
         run: |
-            if [ -z "$ORACLE_WALLET_B64" ]; then
-              echo "::warning::ORACLE_WALLET_B64 secret is not set — skipping wallet configuration"
-              exit 0
-            fi
-            mkdir -p "$WALLET_DIR"
-            # Decode directly to the file format your Python script expects.
-            # Change "ewallet.pem" to "ewallet.p12" below if your python script was updated to look for .p12
-            echo "$ORACLE_WALLET_B64" | base64 -d > "$WALLET_DIR/ewallet.pem"
-          env:
-            ORACLE_WALLET_B64: ${{ secrets.ORACLE_WALLET_B64 }}
+          if [ -z "$ORACLE_WALLET_B64" ]; then
+            echo "::warning::ORACLE_WALLET_B64 secret is not set — skipping wallet configuration"
+            exit 0
+          fi
+          mkdir -p "$WALLET_DIR"
+          # Decode directly to the file format your Python script expects.
+          # Change "ewallet.pem" to "ewallet.p12" below if your python script was updated to look for .p12
+          echo "$ORACLE_WALLET_B64" | base64 -d > "$WALLET_DIR/ewallet.pem"
+        env:
+          ORACLE_WALLET_B64: ${{ secrets.ORACLE_WALLET_B64 }}
 
       - name: Run health check
         run: python -m kalshicast health
