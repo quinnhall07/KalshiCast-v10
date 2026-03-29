@@ -649,22 +649,6 @@ def seed_config_tables(conn: Any) -> None:
     log.info("Seeded %d stations, %d sources, %d params",
              len(STATIONS), len(SOURCES), len(PARAM_DEFS))
     
-    # Seed PARAMS
-    for p in PARAM_DEFS:
-        with conn.cursor() as cur:
-            cur.execute("""
-                MERGE INTO PARAMS tgt USING DUAL
-                ON (tgt.PARAM_KEY = :pk)
-                WHEN NOT MATCHED THEN INSERT (
-                    PARAM_KEY, PARAM_VALUE, DTYPE, DESCRIPTION
-                ) VALUES (
-                    :pk, :pv, :dt, :desc
-                )
-            """, {
-                "pk": p.key, "pv": p.default,
-                "dt": p.dtype, "desc": p.description,
-            })
-
     conn.commit()
     log.info("Seeded %d stations, %d sources, %d params",
              len(STATIONS), len(SOURCES), len(PARAM_DEFS))
