@@ -79,6 +79,12 @@ PARAM_DEFS: list[ParamDef] = [
     ParamDef("kalman.gap_inflate_factor", "2.0", "float", "U_k inflation on state_version gap"),
     ParamDef("kalman.B_init", "0.0", "float", "Initial bias estimate (F)"),
     ParamDef("kalman.U_init", "4.0", "float", "Initial uncertainty (F^2)"),
+    ParamDef("kalman.amendment_lookback_days", "7", "int", "Max days back for retroactive Kalman replay"),
+
+    # --- Regime Detection ---
+    ParamDef("regime.bimodal_iqr_threshold", "1.35", "float", "IQR/S threshold to trigger bimodal detection"),
+    ParamDef("regime.min_centroid_dist", "1.5", "float", "Min centroid distance as multiple of S"),
+    ParamDef("regime.min_cluster_frac", "0.15", "float", "Min fraction of smaller cluster"),
 
     # --- Sigma and Skewness (L2) ---
     ParamDef("sigma.m_prior", "20", "int", "Bayesian shrinkage prior weight"),

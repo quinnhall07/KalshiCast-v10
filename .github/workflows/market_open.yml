@@ -1,0 +1,48 @@
+name: Market Open Pipeline
+on:
+  schedule:
+    - cron: '0 14 * * *'  # 14:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      live:
+        description: 'Run in live mode (submit real orders)'
+        required: false
+        default: 'false'
+
+jobs:
+  market_open:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure Oracle wallet
+        run: |
+          mkdir -p $HOME/oracle_wallet
+          echo "${{ secrets.ORACLE_WALLET_B64 }}" | base64 -d > $HOME/oracle_wallet/wallet.zip
+          cd $HOME/oracle_wallet && unzip -o wallet.zip
+        env:
+          ORACLE_WALLET_B64: ${{ secrets.ORACLE_WALLET_B64 }}
+
+      - name: Run market_open pipeline
+        run: |
+          if [ "${{ github.event.inputs.live }}" = "true" ]; then
+            python -m kalshicast market_open --live
+          else
+            python -m kalshicast market_open
+          fi
+        env:
+          ORACLE_WALLET_DIR: ${{ runner.temp }}/oracle_wallet
+          ORACLE_DSN: ${{ secrets.ORACLE_DSN }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}
+          KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
+          KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}

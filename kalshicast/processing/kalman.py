@@ -274,15 +274,155 @@ def retroactive_kalman_correction(conn: Any, amended_stations: list[tuple],
 
     amended_stations: list of (station_id, target_date) tuples with amended obs.
     Limited to amendment_lookback_days.
+
+    Algorithm:
+    1. For each (station, amended_date), load KALMAN_HISTORY from that date forward
+    2. Reset state to the day *before* the amendment
+    3. Re-read corrected observations and replay each day sequentially
+    4. Mark replayed history rows with is_amendment=True
+    5. Persist final corrected state
+
     Returns count of replayed filters.
     """
+    from kalshicast.db.operations import (
+        get_kalman_state, upsert_kalman_state, insert_kalman_history,
+        get_forecast_errors_window,
+    )
+
     if not amended_stations:
         return 0
 
-    log.info("[kalman] retroactive correction for %d amendments", len(amended_stations))
-    # For Phase 2, log the amendment but don't replay yet
-    # Full replay requires sequential re-processing of all subsequent days
-    for sid, td in amended_stations:
-        log.warning("[kalman] amendment detected: %s on %s — replay not yet implemented", sid, td)
+    lookback = get_param_int("kalman.amendment_lookback_days")
+    replayed = 0
 
-    return 0
+    for station_id, amended_date_str in amended_stations:
+        amended_date = date.fromisoformat(str(amended_date_str)[:10])
+        today = date.today()
+
+        if (today - amended_date).days > lookback:
+            log.info("[kalman] skipping %s/%s — older than %d day lookback",
+                     station_id, amended_date, lookback)
+            continue
+
+        for target_type in ("HIGH", "LOW"):
+            # 1. Load state snapshot from the day before amendment
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT B_K, U_K, Q_K, STATE_VERSION, HISTORY_DATE
+                    FROM KALMAN_HISTORY
+                    WHERE STATION_ID = :sid AND TARGET_TYPE = :tt
+                      AND HISTORY_DATE < TO_DATE(:ad, 'YYYY-MM-DD')
+                    ORDER BY HISTORY_DATE DESC
+                    FETCH FIRST 1 ROWS ONLY
+                """, {"sid": station_id, "tt": target_type,
+                      "ad": amended_date.isoformat()})
+                pre_row = cur.fetchone()
+
+            if pre_row is None:
+                state = init_kalman_state()
+                replay_from = amended_date
+            else:
+                state = KalmanState(
+                    b_k=float(pre_row[0]),
+                    u_k=float(pre_row[1]),
+                    q_base=float(pre_row[2]) if pre_row[2] else 0.0,
+                    state_version=int(pre_row[3]) if pre_row[3] else 0,
+                    last_observation_date=pre_row[4].date() if pre_row[4] else None,
+                )
+                replay_from = amended_date
+
+            # 2. Get all history dates from amendment forward (to know which days to replay)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT DISTINCT TRUNC(HISTORY_DATE) AS HD
+                    FROM KALMAN_HISTORY
+                    WHERE STATION_ID = :sid AND TARGET_TYPE = :tt
+                      AND HISTORY_DATE >= TO_DATE(:ad, 'YYYY-MM-DD')
+                    ORDER BY HD
+                """, {"sid": station_id, "tt": target_type,
+                      "ad": amended_date.isoformat()})
+                replay_dates = [row[0].date() for row in cur]
+
+            if not replay_dates:
+                replay_dates = [amended_date]
+
+            # 3. Delete old history rows that will be replayed
+            with conn.cursor() as cur:
+                cur.execute("""
+                    DELETE FROM KALMAN_HISTORY
+                    WHERE STATION_ID = :sid AND TARGET_TYPE = :tt
+                      AND HISTORY_DATE >= TO_DATE(:ad, 'YYYY-MM-DD')
+                """, {"sid": station_id, "tt": target_type,
+                      "ad": amended_date.isoformat()})
+
+            # 4. Replay each day sequentially
+            for replay_date in replay_dates:
+                errors = get_forecast_errors_window(
+                    conn, station_id, state.top_model_id,
+                    target_type, "h2", 1,
+                )
+                target_err = None
+                for e in errors:
+                    td = e.get("target_date")
+                    if td and str(td)[:10] == replay_date.isoformat():
+                        target_err = e
+                        break
+
+                if target_err is None or target_err.get("error_raw") is None:
+                    continue
+
+                epsilon_k = float(target_err["error_raw"])
+                f_raw = float(target_err["f_raw"]) if target_err.get("f_raw") else 0.0
+
+                R_k = compute_R_k(f_raw, f_raw, 0.0)
+
+                gap_days = 0
+                if state.last_observation_date:
+                    delta = (replay_date - state.last_observation_date).days - 1
+                    gap_days = max(0, delta)
+
+                recent_errors = get_forecast_errors_window(
+                    conn, station_id, state.top_model_id,
+                    target_type, "h2", 30,
+                )
+                recent_innovations = [
+                    float(e["error_raw"]) for e in recent_errors
+                    if e.get("error_raw") is not None
+                ]
+
+                Q_k = compute_Q_k(state.q_base, recent_innovations, state.b_k)
+
+                state, history = kalman_update(state, epsilon_k, R_k, Q_k, gap_days)
+                state.last_observation_date = replay_date
+                history["is_amendment"] = True
+
+                # Update Q_base via EWM
+                if len(recent_innovations) >= 2:
+                    delta_b = [recent_innovations[i] - recent_innovations[i - 1]
+                               for i in range(1, len(recent_innovations))]
+                    state.q_base = _compute_ewm_variance(delta_b)
+
+                # Persist replayed history
+                history["station_id"] = station_id
+                history["target_type"] = target_type
+                history["pipeline_run_id"] = run_id
+                insert_kalman_history(conn, history)
+
+            # 5. Persist final corrected state
+            upsert_kalman_state(conn, station_id, target_type, {
+                "b_k": state.b_k,
+                "u_k": state.u_k,
+                "q_base": state.q_base,
+                "state_version": state.state_version,
+                "top_model_id": state.top_model_id,
+                "last_observation_date": state.last_observation_date,
+            })
+
+            replayed += 1
+            log.info("[kalman] replayed %s/%s from %s (%d days), B_k=%.3f U_k=%.3f",
+                     station_id, target_type, amended_date, len(replay_dates),
+                     state.b_k, state.u_k)
+
+    conn.commit()
+    log.info("[kalman] retroactive correction complete: %d filters replayed", replayed)
+    return replayed

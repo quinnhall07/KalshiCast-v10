@@ -1,0 +1,36 @@
+name: Weekly Calibration
+on:
+  schedule:
+    - cron: '0 3 * * 0'  # 03:00 UTC every Sunday
+  workflow_dispatch:
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Configure Oracle wallet
+        run: |
+          mkdir -p $HOME/oracle_wallet
+          echo "${{ secrets.ORACLE_WALLET_B64 }}" | base64 -d > $HOME/oracle_wallet/wallet.zip
+          cd $HOME/oracle_wallet && unzip -o wallet.zip
+        env:
+          ORACLE_WALLET_B64: ${{ secrets.ORACLE_WALLET_B64 }}
+
+      - name: Run calibration
+        run: python -m kalshicast calibrate
+        env:
+          ORACLE_WALLET_DIR: ${{ runner.temp }}/oracle_wallet
+          ORACLE_DSN: ${{ secrets.ORACLE_DSN }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}
