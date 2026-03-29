@@ -9,6 +9,9 @@ on:
         required: false
         default: 'false'
 
+env:
+  WALLET_DIR: /home/runner/oracle_wallet
+
 jobs:
   market_open:
     runs-on: ubuntu-latest
@@ -26,9 +29,13 @@ jobs:
 
       - name: Configure Oracle wallet
         run: |
-          mkdir -p $HOME/oracle_wallet
-          echo "${{ secrets.ORACLE_WALLET_B64 }}" | base64 -d > $HOME/oracle_wallet/wallet.zip
-          cd $HOME/oracle_wallet && unzip -o wallet.zip
+          if [ -z "$ORACLE_WALLET_B64" ]; then
+            echo "::error::ORACLE_WALLET_B64 secret is not set"
+            exit 1
+          fi
+          mkdir -p "$WALLET_DIR"
+          echo "$ORACLE_WALLET_B64" | base64 -d > "$WALLET_DIR/wallet.zip"
+          cd "$WALLET_DIR" && unzip -o wallet.zip
         env:
           ORACLE_WALLET_B64: ${{ secrets.ORACLE_WALLET_B64 }}
 
@@ -40,7 +47,7 @@ jobs:
             python -m kalshicast market_open
           fi
         env:
-          ORACLE_WALLET_DIR: ${{ runner.temp }}/oracle_wallet
+          ORACLE_WALLET_DIR: /home/runner/oracle_wallet
           ORACLE_DSN: ${{ secrets.ORACLE_DSN }}
           ORACLE_USER: ${{ secrets.ORACLE_USER }}
           ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}

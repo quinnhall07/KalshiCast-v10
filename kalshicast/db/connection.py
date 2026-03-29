@@ -52,7 +52,13 @@ def _oracle_params() -> dict[str, Any]:
         raise RuntimeError(
             "Missing Oracle env vars: ORACLE_USER, ORACLE_PASSWORD, ORACLE_DSN"
         )
-    return {"user": user, "password": password, "dsn": dsn}
+    params: dict[str, Any] = {"user": user, "password": password, "dsn": dsn}
+    wallet_dir = os.getenv("ORACLE_WALLET_DIR")
+    if wallet_dir:
+        params["config_dir"] = wallet_dir
+        params["wallet_location"] = wallet_dir
+        params["wallet_password"] = password
+    return params
 
 
 def _ensure_pool() -> oracledb.ConnectionPool:
