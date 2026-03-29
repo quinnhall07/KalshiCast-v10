@@ -9,7 +9,7 @@ def main() -> None:
     args = sys.argv[1:]
     if not args:
         print("Usage: python -m kalshicast <command>")
-        print("Commands: morning, night, market_open, schema, observations")
+        print("Commands: morning, night, market_open [--live], schema, observations")
         sys.exit(1)
 
     cmd = args[0].lower()
@@ -58,7 +58,7 @@ def main() -> None:
 
     else:
         print(f"Unknown command: {cmd}")
-        print("Commands: morning, night, market_open, schema, observations")
+        print("Commands: morning, night, market_open [--live], schema, observations")
         sys.exit(1)
 
 

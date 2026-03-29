@@ -1114,6 +1114,179 @@ def upsert_financial_metrics(conn: Any, row: dict) -> None:
         })
 
 
+# ─────────────────────────────────────────────────────────────────────
+# L4: Best Bets
+# ─────────────────────────────────────────────────────────────────────
+
+def upsert_best_bets(conn: Any, rows: list[dict]) -> int:
+    """MERGE into BEST_BETS — one row per ticker."""
+    if not rows:
+        return 0
+
+    count = 0
+    for r in rows:
+        import json
+        with conn.cursor() as cur:
+            cur.execute("""
+                MERGE /*+ NO_PARALLEL(tgt) */ INTO BEST_BETS tgt
+                USING DUAL
+                ON (tgt.TICKER = :ticker)
+                WHEN MATCHED THEN UPDATE SET
+                    PIPELINE_RUN_ID = :run_id,
+                    STATION_ID = :sid, TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD'),
+                    TARGET_TYPE = :tt, BIN_LOWER = :bl, BIN_UPPER = :bu,
+                    P_WIN = :pw, CONTRACT_PRICE = :cp, EV_NET = :ev,
+                    EV_THRESHOLD_H = :evth, ORDER_TYPE = :otype,
+                    C_VWAP = :cvwap, C_VWAP_NET = :cvn,
+                    F_STAR = :fstar, F_OP = :fop, F_FINAL = :ffinal,
+                    IBE_COMPOSITE = :ibe, IBE_VETO = :veto, D_SCALE = :dscale,
+                    GAMMA_CONVERGENCE = :gamma,
+                    RANK_WITHIN_STATION_DAY = :rank,
+                    IS_SELECTED_FOR_EXECUTION = :selected,
+                    PIPELINE_RUN_STATUS = :prs,
+                    ALL_GATE_FLAGS_JSON = :gates
+                WHEN NOT MATCHED THEN INSERT (
+                    TICKER, PIPELINE_RUN_ID, STATION_ID, TARGET_DATE, TARGET_TYPE,
+                    BIN_LOWER, BIN_UPPER, P_WIN, CONTRACT_PRICE, EV_NET,
+                    EV_THRESHOLD_H, ORDER_TYPE, C_VWAP, C_VWAP_NET,
+                    F_STAR, F_OP, F_FINAL,
+                    IBE_COMPOSITE, IBE_VETO, D_SCALE, GAMMA_CONVERGENCE,
+                    RANK_WITHIN_STATION_DAY, IS_SELECTED_FOR_EXECUTION,
+                    PIPELINE_RUN_STATUS, ALL_GATE_FLAGS_JSON
+                ) VALUES (
+                    :ticker, :run_id, :sid, TO_DATE(:td, 'YYYY-MM-DD'), :tt,
+                    :bl, :bu, :pw, :cp, :ev,
+                    :evth, :otype, :cvwap, :cvn,
+                    :fstar, :fop, :ffinal,
+                    :ibe, :veto, :dscale, :gamma,
+                    :rank, :selected,
+                    :prs, :gates
+                )
+            """, {
+                "ticker": r["ticker"], "run_id": r.get("pipeline_run_id"),
+                "sid": r.get("station_id"),
+                "td": str(r.get("target_date", ""))[:10],
+                "tt": r.get("target_type"),
+                "bl": r.get("bin_lower"), "bu": r.get("bin_upper"),
+                "pw": r.get("p_win"), "cp": r.get("contract_price"),
+                "ev": r.get("ev_net"), "evth": r.get("ev_threshold_h"),
+                "otype": r.get("order_type"),
+                "cvwap": r.get("c_vwap"), "cvn": r.get("c_vwap_net"),
+                "fstar": r.get("f_star"), "fop": r.get("f_op"),
+                "ffinal": r.get("f_final"),
+                "ibe": r.get("ibe_composite"), "veto": 1 if r.get("ibe_veto") else 0,
+                "dscale": r.get("d_scale"), "gamma": r.get("gamma_convergence"),
+                "rank": r.get("rank_within_station_day"),
+                "selected": 1 if r.get("is_selected_for_execution") else 0,
+                "prs": r.get("pipeline_run_status"),
+                "gates": json.dumps(r.get("gate_flags")) if r.get("gate_flags") else None,
+            })
+            count += 1
+    return count
+
+
+# ─────────────────────────────────────────────────────────────────────
+# L4: Orderbook Snapshots
+# ─────────────────────────────────────────────────────────────────────
+
+def insert_orderbook_snapshot(conn: Any, row: dict) -> None:
+    """INSERT into MARKET_ORDERBOOK_SNAPSHOTS."""
+    import json
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO MARKET_ORDERBOOK_SNAPSHOTS (
+                TICKER, SNAPSHOT_UTC, YES_BOOK_JSON, NO_BOOK_JSON,
+                C_VWAP_COMPUTED, AVAILABLE_DEPTH
+            ) VALUES (
+                :ticker, SYSTIMESTAMP, :yes, :no, :cvwap, :depth
+            )
+        """, {
+            "ticker": row["ticker"],
+            "yes": json.dumps(row.get("yes_book")) if row.get("yes_book") else None,
+            "no": json.dumps(row.get("no_book")) if row.get("no_book") else None,
+            "cvwap": row.get("c_vwap"),
+            "depth": row.get("available_depth"),
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────
+# L4: IBE Signal Log
+# ─────────────────────────────────────────────────────────────────────
+
+def insert_ibe_signal_log(conn: Any, row: dict) -> None:
+    """INSERT into IBE_SIGNAL_LOG."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO IBE_SIGNAL_LOG (
+                TICKER, PIPELINE_RUN_ID,
+                KCV_NORM, KCV_MOD, MPDS_K, MPDS_MOD,
+                HMAS, HMAS_MOD, FCT, FCT_MOD, SCAS, SCAS_MOD,
+                COMPOSITE, VETO_TRIGGERED, VETO_REASON
+            ) VALUES (
+                :ticker, :run_id,
+                :kcv_norm, :kcv_mod, :mpds_k, :mpds_mod,
+                :hmas, :hmas_mod, :fct, :fct_mod, :scas, :scas_mod,
+                :composite, :veto, :reason
+            )
+        """, {
+            "ticker": row.get("ticker"),
+            "run_id": row.get("pipeline_run_id"),
+            "kcv_norm": row.get("kcv_norm"),
+            "kcv_mod": row.get("kcv_mod"),
+            "mpds_k": row.get("mpds_k"),
+            "mpds_mod": row.get("mpds_mod"),
+            "hmas": row.get("hmas"),
+            "hmas_mod": row.get("hmas_mod"),
+            "fct": row.get("fct"),
+            "fct_mod": row.get("fct_mod"),
+            "scas": row.get("scas"),
+            "scas_mod": row.get("scas_mod"),
+            "composite": row.get("composite"),
+            "veto": 1 if row.get("veto") else 0,
+            "reason": row.get("veto_reason"),
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────
+# L4: Position Queries
+# ─────────────────────────────────────────────────────────────────────
+
+def get_open_positions(conn: Any, station_id: str | None = None) -> list[dict]:
+    """SELECT open positions, optionally filtered by station."""
+    sql = """
+        SELECT POSITION_ID, TICKER, STATION_ID, TARGET_DATE, TARGET_TYPE,
+               ENTRY_PRICE, CONTRACTS, ORDER_TYPE, STATUS
+        FROM POSITIONS WHERE STATUS = 'OPEN'
+    """
+    binds: dict = {}
+    if station_id:
+        sql += " AND STATION_ID = :sid"
+        binds["sid"] = station_id
+
+    with conn.cursor() as cur:
+        cur.execute(sql, binds)
+        cols = [c[0].lower() for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur]
+
+
+def get_previous_shadow_book(conn: Any, ticker: str) -> dict | None:
+    """Get previous Shadow Book entry for MPDS computation."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT P_WIN, PIPELINE_RUN_ID, UPDATED_AT
+            FROM SHADOW_BOOK
+            WHERE TICKER = :ticker
+        """, {"ticker": ticker})
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "p_win": float(row[0]) if row[0] is not None else None,
+        "pipeline_run_id": row[1],
+        "updated_at": row[2],
+    }
+
+
 def insert_system_alert(conn: Any, alert: dict) -> None:
     """Insert a new SYSTEM_ALERT."""
     sql = """
