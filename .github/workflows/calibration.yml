@@ -25,15 +25,14 @@ jobs:
       - name: Configure Oracle wallet
         run: |
           if [ -z "$ORACLE_WALLET_B64" ]; then
-            echo "::error::ORACLE_WALLET_B64 secret is not set"
-            exit 1
+            echo "::warning::ORACLE_WALLET_B64 secret is not set — skipping wallet configuration"
+            exit 0
           fi
           mkdir -p "$WALLET_DIR"
-          echo "$ORACLE_WALLET_B64" | base64 -d > "$WALLET_DIR/wallet.zip"
-          cd "$WALLET_DIR" && unzip -o wallet.zip
+          echo "$ORACLE_WALLET_B64" | base64 -d > "$WALLET_DIR/ewallet.pem"
         env:
           ORACLE_WALLET_B64: ${{ secrets.ORACLE_WALLET_B64 }}
-
+          
       - name: Run calibration
         run: python -m kalshicast calibrate
         env:
