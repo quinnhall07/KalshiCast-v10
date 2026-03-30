@@ -376,7 +376,7 @@ def upsert_observation(
       OBSERVED_HIGH_F  = :observed_high,
       OBSERVED_LOW_F   = :observed_low,
       SOURCE           = :source,
-      FLAGGED_RAW_TEXT = COALESCE(:flagged_raw_text, tgt.FLAGGED_RAW_TEXT),
+      FLAGGED_RAW_TEXT = COALESCE(TO_CLOB(:flagged_raw_text), tgt.FLAGGED_RAW_TEXT),
       FLAGGED_REASON   = COALESCE(:flagged_reason,   tgt.FLAGGED_REASON)
     WHEN NOT MATCHED THEN INSERT (
       STATION_ID, TARGET_DATE,
