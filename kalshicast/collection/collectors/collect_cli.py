@@ -410,7 +410,7 @@ def fetch_observations_for_station(*, conn, run_id, station: dict, target_date: 
             if hi_lo is not None:
                 high, low, _text, _issued_at = hi_lo
                 upsert_observation(
-                    conn=conn, run_id=run_id, station_id=station_id, date=target_date,
+                    conn=conn, station_id=station_id, target_date=target_date,
                     observed_high=high, observed_low=low, source="NWS_CLI",
                 )
                 print(f"[obs] OK {station_id} {target_date}: high={high} low={low} (CLI)", flush=True)
@@ -421,7 +421,7 @@ def fetch_observations_for_station(*, conn, run_id, station: dict, target_date: 
             if fb:
                 high, low = fb
                 upsert_observation(
-                    conn=conn, run_id=run_id, station_id=station_id, date=target_date,
+                    conn=conn, station_id=station_id, target_date=target_date,
                     observed_high=high, observed_low=low, source="NWS_OBS_FALLBACK",
                     flagged_reason="CLI unparseable/missing; used station observations fallback",
                 )
