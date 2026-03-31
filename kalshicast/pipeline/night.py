@@ -126,6 +126,7 @@ def main() -> None:
         try:
             from kalshicast.evaluation.brier import grade_brier_scores
             n_graded = grade_brier_scores(conn, target_date)
+            conn.commit()  # <--- Add this missing commit
             steps_ok += 1
             log.info("Step 9 OK: %d Brier scores graded", n_graded)
         except Exception as e:
