@@ -15,7 +15,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
-from kalshicast.config.params_bootstrap import get_param_int, get_param_float, load_db_overrides
+from kalshicast.config.params_bootstrap import get_param_int, get_param_float, load_db_overrides, get_param_bool
 from kalshicast.db.connection import init_db, get_conn, close_pool
 from kalshicast.db.schema import ensure_schema, seed_config_tables
 from kalshicast.db.operations import (
@@ -58,6 +58,12 @@ def main() -> None:
         load_db_overrides(db_params)
     finally:
         conn.close()
+
+    is_halted = get_param_bool("system.trading_halted", default=False)
+    
+    if is_halted:
+        log.warning("TRADING HALTED: 'system.trading_halted' is set to True in the database. Aborting execution.")
+        return
 
     # Target dates: today + next FORECAST_DAYS
     now_utc = datetime.now(timezone.utc)
