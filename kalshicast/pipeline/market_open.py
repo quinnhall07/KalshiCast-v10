@@ -59,12 +59,6 @@ def main() -> None:
     finally:
         conn.close()
 
-    is_halted = get_param_bool("system.trading_halted", default=False)
-    
-    if is_halted:
-        log.warning("TRADING HALTED: 'system.trading_halted' is set to True in the database. Aborting execution.")
-        return
-
     # Target dates: today + next FORECAST_DAYS
     now_utc = datetime.now(timezone.utc)
     forecast_days = get_param_int("pipeline.forecast_days")
@@ -153,37 +147,53 @@ def main() -> None:
             status = "PARTIAL"
 
         # Steps 8-10: Live execution (gates, IBE, Kelly, orders)
+        # Steps 8-10: Live execution (gates, IBE, Kelly, orders)
         if live_mode and client is not None:
-            # Step 8: fetch_market_prices
-            try:
-                total_bets = _step8_fetch_market_prices(conn, client, pipeline_run_id)
-                log.info("Step 8 OK: %d orderbook snapshots", total_bets)
-            except Exception as e:
-                log.error("Step 8 ERROR: market price fetch failed: %s", e)
-                status = "PARTIAL"
+            
+            # --- RISK MANAGEMENT GATE ---
+            from kalshicast.execution.risk_manager import evaluate_system_health
+            is_offline = evaluate_system_health(conn, bankroll)
+            is_halted = get_param_bool("system.trading_halted", default=False)
+            
+            if is_halted:
+                log.warning("EXECUTION ABORTED: System is manually HALTED.")
+                status = "HALTED"
+            elif is_offline:
+                from kalshicast.config.params_bootstrap import get_param_str
+                offline_reason = get_param_str("system.offline_reason", default="Unknown Risk")
+                log.warning("EXECUTION SKIPPED: System is OFFLINE. Reason: %s", offline_reason)
+                status = "OFFLINE"
+            else:
+                # Step 8: fetch_market_prices
+                try:
+                    total_bets = _step8_fetch_market_prices(conn, client, pipeline_run_id)
+                    log.info("Step 8 OK: %d orderbook snapshots", total_bets)
+                except Exception as e:
+                    log.error("Step 8 ERROR: market price fetch failed: %s", e)
+                    status = "PARTIAL"
 
-            # Step 9: evaluate_gates_and_ibe
-            try:
-                best_bets = _step9_evaluate_gates_ibe(
-                    conn, pipeline_run_id, bankroll, target_dates)
-                total_bets = len(best_bets)
-                log.info("Step 9 OK: %d best bets evaluated", total_bets)
-            except Exception as e:
-                log.error("Step 9 ERROR: gate/IBE evaluation failed: %s", e)
-                best_bets = []
-                status = "PARTIAL"
+                # Step 9: evaluate_gates_and_ibe
+                try:
+                    best_bets = _step9_evaluate_gates_ibe(
+                        conn, pipeline_run_id, bankroll, target_dates)
+                    total_bets = len(best_bets)
+                    log.info("Step 9 OK: %d best bets evaluated", total_bets)
+                except Exception as e:
+                    log.error("Step 9 ERROR: gate/IBE evaluation failed: %s", e)
+                    best_bets = []
+                    status = "PARTIAL"
 
-            # Step 10: submit_orders
-            try:
-                from kalshicast.execution.orders import execute_best_bets
-                summary = execute_best_bets(client, conn, best_bets)
-                total_orders = summary.get("submitted", 0)
-                log.info("Step 10 OK: %d orders submitted, %d filled, %d skipped, %d errors",
-                         summary.get("submitted", 0), summary.get("filled", 0),
-                         summary.get("skipped", 0), summary.get("errors", 0))
-            except Exception as e:
-                log.error("Step 10 ERROR: order submission failed: %s", e)
-                status = "PARTIAL"
+                # Step 10: submit_orders
+                try:
+                    from kalshicast.execution.orders import execute_best_bets
+                    summary = execute_best_bets(client, conn, best_bets)
+                    total_orders = summary.get("submitted", 0)
+                    log.info("Step 10 OK: %d orders submitted, %d filled, %d skipped, %d errors",
+                             summary.get("submitted", 0), summary.get("filled", 0),
+                             summary.get("skipped", 0), summary.get("errors", 0))
+                except Exception as e:
+                    log.error("Step 10 ERROR: order submission failed: %s", e)
+                    status = "PARTIAL"
         else:
             log.info("Steps 8-10: SKIPPED (%s mode — no market fetch, gates, or orders)", mode_str)
 
