@@ -74,6 +74,14 @@ def main() -> None:
         except Exception as e:
             log.warning("Step 3 WARN: observation fetch failed: %s", e)
 
+        # Step 3b: settle paper positions now that observations are available
+         try:
+             from kalshicast.pipeline.paper_sim import settle_paper_positions
+             n_paper_settled = settle_paper_positions(conn)
+             log.info("Step 3b OK: %d paper positions settled", n_paper_settled)
+        except Exception as e:
+            log.warning("Step 3b WARN: paper settlement failed: %s", e)
+
         # Step 4: check_amendments
         try:
             amended = _check_amendments(conn, target_date)
