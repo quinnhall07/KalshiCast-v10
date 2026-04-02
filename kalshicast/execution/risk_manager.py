@@ -35,12 +35,25 @@ def evaluate_system_health(conn: Any, bankroll: float) -> bool:
         is_offline = True
         reasons.append(f"Bankroll (${bankroll:.2f}) is $5.00 or below")
     
-    # 3. Condition: Warmup Period (Phase 2 Paper Trading)
-    days_active = db.get_system_metric("days_active")
-    warmup_required = int(db.get_param("system.warmup_days", default="30"))
+    # Condition 3: Warmup Period (Phase 2 Paper Trading)
+    days_active = 0
+    try:
+        with conn.cursor() as cur:
+            # Count how many successful daily pipeline runs have completed
+            cur.execute("SELECT COUNT(DISTINCT TARGET_DATE) FROM PIPELINE_DAY_HEALTH WHERE IS_HEALTHY = 1")
+            row = cur.fetchone()
+            if row:
+                days_active = int(row[0])
+    except Exception as e:
+        log.warning("Could not fetch days_active for risk check: %s", e)
+
+    # Use get_param_int (ensure it is imported from kalshicast.config.params_bootstrap)
+    from kalshicast.config.params_bootstrap import get_param_int
+    warmup_required = get_param_int("system.warmup_days", default=30)
+    
     if days_active < warmup_required:
         is_offline = True
-        reasons.append(f"Warmup period active (Day {days_active}/{warmup_required})")
+        reasons.append(f"Warmup Active (Day {days_active}/{warmup_required})")
   
     # Determine state transitions
     currently_offline = get_param_bool("system.trading_offline", default=False)
