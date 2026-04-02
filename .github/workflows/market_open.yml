@@ -54,7 +54,7 @@ jobs:
           KALSHI_PRIVATE_KEY: ${{ secrets.KALSHI_PRIVATE_KEY }}
 
       - name: Log Failure to Database
-        if: failure()
+        if: failure() || cancelled()
         env:
           ORACLE_USER: ${{ secrets.ORACLE_USER }}
           ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}
