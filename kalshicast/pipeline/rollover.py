@@ -1,6 +1,7 @@
 """Date rollover — METAR initialization, Shadow Book finalization, settlement.
 
 Runs at the start of each day to prepare tables and settle expired positions.
+Includes paper position settlement for simulation mode.
 """
 
 from __future__ import annotations
@@ -52,10 +53,7 @@ def finalize_shadow_book(conn: Any, target_date: str) -> int:
 
 
 def settle_positions(conn: Any) -> int:
-    """Check for settled markets and update POSITIONS with outcomes and PnL.
-
-    A position is settled when its TARGET_DATE has passed and observations exist.
-    """
+    """Settle live OPEN positions against real observations."""
     with conn.cursor() as cur:
         cur.execute("""
             UPDATE POSITIONS p SET
@@ -98,6 +96,7 @@ def settle_positions(conn: Any) -> int:
                 END,
                 FILLED_AT = SYSTIMESTAMP
             WHERE p.STATUS = 'OPEN'
+              AND p.IS_PAPER = 0          -- live only
               AND p.TARGET_DATE < TRUNC(SYSDATE)
               AND EXISTS (
                   SELECT 1 FROM OBSERVATIONS o
@@ -107,32 +106,37 @@ def settle_positions(conn: Any) -> int:
         """)
         count = cur.rowcount or 0
 
-    # Compute net PnL (gross - fees)
     if count > 0:
         with conn.cursor() as cur:
             cur.execute("""
                 UPDATE POSITIONS SET
                     PNL_NET = PNL_GROSS - ABS(PNL_GROSS) * 0.07
-                WHERE STATUS = 'SETTLED' AND PNL_NET IS NULL
+                WHERE STATUS = 'SETTLED'
+                  AND IS_PAPER = 0
+                  AND PNL_NET IS NULL
             """)
 
     conn.commit()
-    log.info("[rollover] settled %d positions", count)
+    log.info("[rollover] settled %d live positions", count)
     return count
 
 
 def run_rollover(conn: Any) -> dict:
     """Master rollover sequence — run at start of each day."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    from kalshicast.pipeline.paper_sim import settle_paper_positions
+
+    today     = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    metar_init = init_metar_daily_max(conn, today)
-    sb_final = finalize_shadow_book(conn, yesterday)
-    settled = settle_positions(conn)
+    metar_init    = init_metar_daily_max(conn, today)
+    sb_final      = finalize_shadow_book(conn, yesterday)
+    settled       = settle_positions(conn)
+    paper_settled = settle_paper_positions(conn)
 
     return {
-        "date": today,
-        "metar_initialized": metar_init,
-        "shadow_book_finalized": sb_final,
-        "positions_settled": settled,
+        "date":                    today,
+        "metar_initialized":       metar_init,
+        "shadow_book_finalized":   sb_final,
+        "positions_settled":       settled,
+        "paper_positions_settled": paper_settled,
     }
