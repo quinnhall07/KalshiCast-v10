@@ -146,7 +146,29 @@ def main() -> None:
             log.error("Step 7 ERROR: shadow book pricing failed: %s", e)
             status = "PARTIAL"
 
-        # Steps 8-10: Live execution (gates, IBE, Kelly, orders)
+        # Step 7.5: create_paper_positions (paper mode only)
+        # Converts IS_SELECTED_FOR_EXECUTION BEST_BETS → PAPER_OPEN POSITIONS
+        # so that the night pipeline can settle and grade them.
+        if not live_mode:
+            try:
+                from kalshicast.execution.gates import evaluate_all_gates
+                from kalshicast.execution.kelly import smirnov_kelly, full_sizing_chain
+                from kalshicast.db.operations import upsert_best_bets
+ 
+                # In paper mode we still need to populate BEST_BETS with
+                # IS_SELECTED_FOR_EXECUTION = 1 so paper_sim has rows to consume.
+                # Re-use the same gate/Kelly logic as live, but skip order submission.
+                best_bets_paper = _step9_evaluate_gates_ibe(
+                    conn, pipeline_run_id,
+                    bankroll=1000.0,        # paper bankroll
+                    target_dates=target_dates,
+                )
+                from kalshicast.pipeline.paper_sim import create_paper_positions
+                n_paper = create_paper_positions(conn, pipeline_run_id)
+                log.info("Step 7.5 OK: %d paper positions created", n_paper)
+            except Exception as e:
+                log.warning("Step 7.5 WARN: paper position creation failed: %s", e)
+
         # Steps 8-10: Live execution (gates, IBE, Kelly, orders)
         if live_mode and client is not None:
             
