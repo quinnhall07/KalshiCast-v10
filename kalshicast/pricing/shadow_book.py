@@ -139,25 +139,16 @@ def normalize_probabilities(probs: list[float],
 
 def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
     """Generate Shadow Book for all (station, date, type) with ensemble state.
-
-    Steps per cell:
-    1. Read ENSEMBLE_STATE for (μ_corrected, σ_eff, g1_s, top_model)
-    2. Convert to skew-normal params (ξ, ω, α)
-    3. Generate bins (paper mode: synthetic 2°F bins)
-    4. Compute P(win) per bin
-    5. Normalize
-    6. Write SHADOW_BOOK + SHADOW_BOOK_HISTORY
-
-    Returns count of shadow book rows written.
+    
+    Optimized for bulk DB fetching to prevent N+1 query latency.
     """
-    from kalshicast.db.operations import (
-        upsert_shadow_book, insert_shadow_book_history,
-        get_kalman_state,
-    )
+    from collections import defaultdict
+    from kalshicast.db.operations import upsert_shadow_book, insert_shadow_book_history
     from kalshicast.pricing.bin_convention import generate_station_bins
     from kalshicast.pricing.truncation import apply_metar_truncation
+    from kalshicast.processing.skewness import compute_skewness
 
-    # Read all ensemble state for this run
+    # 1. Read all ensemble state for this run
     with conn.cursor() as cur:
         cur.execute("""
             SELECT STATION_ID, TARGET_DATE, TARGET_TYPE,
@@ -172,9 +163,36 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
         log.warning("[shadow_book] no ensemble state for run %s", run_id)
         return 0
 
+    # 2. BULK FETCH: Kalman States
+    # Fetch all Kalman states at once instead of querying per-station inside the loop
+    kalman_cache: dict[str, float] = {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT STATION_ID, TARGET_TYPE, B_K FROM KALMAN_STATE")
+        for row in cur:
+            key = f"{row[0]}|{row[1]}"
+            kalman_cache[key] = float(row[2]) if row[2] is not None else 0.0
+
+    # 3. BULK FETCH: Forecast Errors (Last 90 days)
+    # Fetch all historical errors at once to compute skewness efficiently
+    window = get_param_int("sigma.rmse_window_days")
+    error_cache = defaultdict(list)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT STATION_ID, MODEL_ID, TARGET_TYPE, ERROR_ADJUSTED, ERROR_RAW
+            FROM FORECAST_ERRORS
+            WHERE LEAD_BRACKET = 'h2'
+              AND TARGET_DATE >= CURRENT_DATE - :window
+        """, {"window": window})
+        for row in cur:
+            sid, mid, tt, e_adj, e_raw = row[0], row[1], row[2], row[3], row[4]
+            if e_adj is not None or e_raw is not None:
+                val = float(e_adj if e_adj is not None else e_raw)
+                error_cache[f"{sid}|{mid}|{tt}"].append(val)
+
     sb_rows = []
     history_rows = []
 
+    # 4. Process all rows in memory (Zero DB calls inside this loop!)
     for er in ensemble_rows:
         station_id = er["station_id"]
         target_type = er["target_type"]
@@ -185,25 +203,14 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
         if f_top is None:
             continue
 
-        # Get Kalman bias correction
-        ks = get_kalman_state(conn, station_id, target_type)
-        b_k = ks["b_k"] if ks else 0.0
+        # Get Kalman bias correction from local cache
+        ks_key = f"{station_id}|{target_type}"
+        b_k = kalman_cache.get(ks_key, 0.0)
         mu = f_top + b_k
 
-        # Get skewness from ensemble (stored in processing)
-        # For now, compute from error history or use 0.0
-        from kalshicast.db.operations import get_forecast_errors_window
-        from kalshicast.processing.skewness import compute_skewness
-
-        window = get_param_int("sigma.rmse_window_days")
-        err_rows = get_forecast_errors_window(
-            conn, station_id, top_model, target_type, "h2", window
-        )
-        err_vals = [
-            float(e["error_adjusted"] if e.get("error_adjusted") is not None else e.get("error_raw"))
-            for e in err_rows
-            if (e.get("error_adjusted") is not None or e.get("error_raw") is not None)
-        ]
+        # Get historical errors from local cache to compute skewness
+        err_key = f"{station_id}|{top_model}|{target_type}"
+        err_vals = error_cache.get(err_key, [])
         g1_s = compute_skewness(err_vals)
 
         # Convert to skew-normal params
@@ -213,15 +220,12 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
         bins = generate_station_bins(station_id, target_date, mu, target_type)
 
         # Compute P(win) for each bin
-        probs = []
-        for b in bins:
-            p = compute_p_win(b["bin_lower"], b["bin_upper"], xi_s, omega_s, alpha_s)
-            probs.append(p)
+        probs = [compute_p_win(b["bin_lower"], b["bin_upper"], xi_s, omega_s, alpha_s) for b in bins]
 
         # Normalize
         probs = normalize_probabilities(probs)
 
-        # Apply METAR truncation (stub in Phase 2)
+        # Apply METAR truncation
         bin_probs = [{"bin": b, "p_win": p} for b, p in zip(bins, probs)]
         bin_probs = apply_metar_truncation(
             bin_probs, station_id, target_date, target_type,
@@ -233,7 +237,7 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
             b = bp["bin"]
             p_win = bp["p_win"]
 
-            row = {
+            sb_rows.append({
                 "ticker": b["ticker"],
                 "station_id": station_id,
                 "target_date": target_date,
@@ -251,8 +255,7 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
                 "t_obs_max": None,
                 "top_model_id": top_model,
                 "pipeline_run_id": run_id,
-            }
-            sb_rows.append(row)
+            })
 
             history_rows.append({
                 "ticker": b["ticker"],
@@ -262,7 +265,7 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
                 "pipeline_run_id": run_id,
             })
 
-    # Write to DB
+    # 5. Bulk Write to DB
     wrote = 0
     if sb_rows:
         wrote = upsert_shadow_book(conn, sb_rows)
