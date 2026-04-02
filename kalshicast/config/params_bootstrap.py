@@ -194,3 +194,19 @@ def get_param_int(key: str) -> int:
 
 def get_param_float(key: str) -> float:
     return float(get_param(key))
+
+def get_param_str(key: str, default: str = "") -> str:
+    """Return string parameter with an optional fallback default."""
+    try:
+        return get_param(key)
+    except KeyError:
+        return default
+
+
+def get_param_bool(key: str, default: bool = False) -> bool:
+    """Return boolean parameter, parsing strings like 'true' or '1'."""
+    try:
+        val = get_param(key)
+        return str(val).lower() in ("1", "true", "t", "yes", "on")
+    except KeyError:
+        return default
