@@ -46,3 +46,12 @@ jobs:
           VISUALCROSSING_KEY: ${{ secrets.VISUALCROSSING_KEY }}
           TOMORROW_API_KEY: ${{ secrets.TOMORROW_API_KEY }}
           WEATHERAPI_KEY: ${{ secrets.WEATHERAPI_KEY }}
+
+      - name: Log Failure to Database
+        if: failure()
+        env:
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_PASSWORD: ${{ secrets.ORACLE_PASSWORD }}
+          ORACLE_DSN: ${{ secrets.ORACLE_DSN }}
+        run: |
+          python scripts/log_gh_failure.py "${{ github.workflow }}" "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
