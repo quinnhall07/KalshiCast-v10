@@ -60,3 +60,26 @@ class TestOmeHistoricalAdapter:
         # 2-day offset at noon UTC to target at 15:00 local = roughly 51 hours
         h = _approx_lead_hours(offset_days=2, target_local_hour=15)
         assert 47 < h < 53   # h3 bracket
+
+# kalshicast/tests/test_backfill_forecasts.py — append
+
+class TestErrorReplay:
+    def test_chronological_dates_generator(self):
+        from kalshicast.backfill.errors import _date_range
+        dates = list(_date_range("2023-01-01", "2023-01-05"))
+        assert dates == [
+            "2023-01-01", "2023-01-02", "2023-01-03",
+            "2023-01-04", "2023-01-05",
+        ]
+
+    def test_date_range_single_day(self):
+        from kalshicast.backfill.errors import _date_range
+        dates = list(_date_range("2023-06-15", "2023-06-15"))
+        assert dates == ["2023-06-15"]
+
+    def test_date_range_respects_order(self):
+        from kalshicast.backfill.errors import _date_range
+        dates = list(_date_range("2023-01-01", "2023-12-31"))
+        assert dates == sorted(dates)
+        assert len(dates) == 365
+
