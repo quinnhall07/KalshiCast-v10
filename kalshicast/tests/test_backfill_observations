@@ -21,3 +21,27 @@ class TestSchemaFlags:
         names = [m[0] for m in MIGRATIONS]
         assert "FORECAST_RUNS.IS_BACKFILL" in names
         assert "FORECAST_ERRORS.LEAD_HOURS_APPROX" in names
+
+
+class TestBackfillConfig:
+    def test_backfill_window_is_valid(self):
+        from kalshicast.backfill.config import BACKFILL_START, BACKFILL_END
+        from datetime import date
+        assert isinstance(BACKFILL_START, date)
+        assert isinstance(BACKFILL_END, date)
+        assert BACKFILL_START < BACKFILL_END
+        assert (BACKFILL_END - BACKFILL_START).days >= 365
+
+    def test_all_stations_have_asos_id(self):
+        from kalshicast.backfill.config import STATION_ASOS_MAP
+        from kalshicast.config.stations import STATIONS
+        for s in STATIONS:
+            sid = s["station_id"]
+            assert sid in STATION_ASOS_MAP, f"{sid} missing from STATION_ASOS_MAP"
+
+    def test_ome_models_list_matches_sources(self):
+        from kalshicast.backfill.config import OME_HISTORICAL_MODELS
+        # Must cover the 5 OME sources in SOURCES config
+        model_ids = [m["source_id"] for m in OME_HISTORICAL_MODELS]
+        for expected in ["OME_BASE", "OME_GFS", "OME_EC", "OME_ICON", "OME_GEM"]:
+            assert expected in model_ids, f"{expected} missing from OME_HISTORICAL_MODELS"
