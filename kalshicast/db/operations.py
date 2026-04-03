@@ -1307,3 +1307,69 @@ def insert_system_alert(conn: Any, alert: dict) -> None:
             "sev": alert.get("severity_score"),
             "details": json.dumps(alert.get("details")) if alert.get("details") else None,
         })
+
+def get_backfill_coverage(
+    conn: Any,
+    start_date: str,
+    end_date: str,
+) -> dict:
+    """Return what backfill data already exists in the DB for the given window.
+
+    Used by the orchestrator to skip already-loaded dates (idempotency).
+
+    Returns:
+        {
+          "observation_dates": set of "YYYY-MM-DD" strings,
+          "forecast_dates": dict[source_id -> set of "YYYY-MM-DD"],
+          "error_dates": set of "YYYY-MM-DD" strings,
+          "kalman_dates": set of "YYYY-MM-DD" strings,
+        }
+    """
+    # Observation dates with at least one station covered
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT TO_CHAR(TARGET_DATE, 'YYYY-MM-DD')
+            FROM OBSERVATIONS
+            WHERE TARGET_DATE BETWEEN TO_DATE(:s, 'YYYY-MM-DD')
+                                  AND TO_DATE(:e, 'YYYY-MM-DD')
+        """, {"s": start_date, "e": end_date})
+        obs_dates = {row[0] for row in cur}
+
+    # Forecast dates per source_id (via FORECAST_RUNS join)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT fr.SOURCE_ID, TO_CHAR(fd.TARGET_DATE, 'YYYY-MM-DD')
+            FROM FORECASTS_DAILY fd
+            JOIN FORECAST_RUNS fr ON fr.RUN_ID = fd.RUN_ID
+            WHERE fd.TARGET_DATE BETWEEN TO_DATE(:s, 'YYYY-MM-DD')
+                                     AND TO_DATE(:e, 'YYYY-MM-DD')
+        """, {"s": start_date, "e": end_date})
+        fc_dates: dict[str, set] = {}
+        for src, d in cur:
+            fc_dates.setdefault(src, set()).add(d)
+
+    # Error dates (any source)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT TO_CHAR(TARGET_DATE, 'YYYY-MM-DD')
+            FROM FORECAST_ERRORS
+            WHERE TARGET_DATE BETWEEN TO_DATE(:s, 'YYYY-MM-DD')
+                                  AND TO_DATE(:e, 'YYYY-MM-DD')
+        """, {"s": start_date, "e": end_date})
+        err_dates = {row[0] for row in cur}
+
+    # Kalman dates (last observation date per state)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT TO_CHAR(LAST_OBSERVATION_DATE, 'YYYY-MM-DD')
+            FROM KALMAN_STATES
+            WHERE LAST_OBSERVATION_DATE IS NOT NULL
+        """)
+        kalman_dates = {row[0] for row in cur if row[0]}
+
+    return {
+        "observation_dates": obs_dates,
+        "forecast_dates": fc_dates,
+        "error_dates": err_dates,
+        "kalman_dates": kalman_dates,
+    }
