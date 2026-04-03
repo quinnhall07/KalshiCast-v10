@@ -574,6 +574,9 @@ def ensure_schema(conn: Any) -> list[str]:
         except Exception:
             pass  # index already exists
 
+    from kalshicast.db.migrations.add_backfill_flags import run_migrations as _run_backfill_flags
+    _run_backfill_flags(conn)
+
     conn.commit()
     return created
 
