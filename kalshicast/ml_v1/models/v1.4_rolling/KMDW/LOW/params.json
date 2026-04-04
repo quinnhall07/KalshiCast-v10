@@ -1,0 +1,19 @@
+{
+    "xgb": {
+        "max_depth": 4,
+        "learning_rate": 0.026880615364598306,
+        "n_estimators": 649,
+        "subsample": 0.9447253149996372,
+        "colsample_bytree": 0.9875656039398008,
+        "gamma": 1.8475430140286453
+    },
+    "lgbm": {
+        "num_leaves": 107,
+        "learning_rate": 0.03203751701678759,
+        "n_estimators": 453,
+        "min_child_samples": 49,
+        "feature_fraction": 0.886111570043473,
+        "bagging_fraction": 0.6332331899265984,
+        "bagging_freq": 7
+    }
+}

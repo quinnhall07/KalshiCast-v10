@@ -64,8 +64,10 @@ def run_tuning(station_id, lat, lon):
     if df.empty: return
     
     df = df.sort_values('time')
-    split = int(len(df) * 0.8)
-    train, valid = df.iloc[:split], df.iloc[split:]
+    split_train = int(len(df) * 0.6)
+    split_valid = int(len(df) * 0.8)
+    train = df.iloc[:split_train]
+    valid = df.iloc[split_train:split_valid]
     
     for t_type in ['HIGH', 'LOW']:
         feat = FEATURES[t_type]

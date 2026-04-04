@@ -1,19 +1,19 @@
 {
     "xgb": {
-        "max_depth": 5,
-        "learning_rate": 0.0066100579893490705,
-        "n_estimators": 687,
-        "subsample": 0.6963528387670435,
-        "colsample_bytree": 0.8885523862584249,
-        "gamma": 2.115023381846942
+        "max_depth": 6,
+        "learning_rate": 0.006624780471671926,
+        "n_estimators": 292,
+        "subsample": 0.9329536571733229,
+        "colsample_bytree": 0.8859045487202446,
+        "gamma": 0.8067818360814649
     },
     "lgbm": {
-        "num_leaves": 56,
-        "learning_rate": 0.07634714990163245,
-        "n_estimators": 148,
-        "min_child_samples": 49,
-        "feature_fraction": 0.6376192117291652,
-        "bagging_fraction": 0.6272971683485971,
-        "bagging_freq": 3
+        "num_leaves": 81,
+        "learning_rate": 0.01311639616417479,
+        "n_estimators": 213,
+        "min_child_samples": 35,
+        "feature_fraction": 0.980267412385541,
+        "bagging_fraction": 0.7069188446429419,
+        "bagging_freq": 1
     }
 }
