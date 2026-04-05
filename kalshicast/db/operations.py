@@ -6,6 +6,7 @@ Uses MERGE USING (UNION ALL) for batch upserts.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -663,81 +664,55 @@ def insert_kalman_history(conn: Any, row: dict) -> None:
         })
 
 
-def get_kalman_history(conn: Any, station_id: str, target_type: str,
-                       since_date: str) -> list[dict]:
-    """Read KALMAN_HISTORY since a given date for amendment replay."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT B_K, U_K, Q_K, R_K, K_K, EPSILON_K, STATE_VERSION, CREATED_AT
-            FROM KALMAN_HISTORY
-            WHERE STATION_ID = :sid AND TARGET_TYPE = :tt
-              AND CREATED_AT >= TO_DATE(:since, 'YYYY-MM-DD')
-            ORDER BY CREATED_AT
-        """, {"sid": station_id, "tt": target_type, "since": since_date})
-        rows = []
-        for r in cur:
-            rows.append({
-                "b_k": float(r[0]) if r[0] is not None else 0.0,
-                "u_k": float(r[1]) if r[1] is not None else 4.0,
-                "q_k": float(r[2]) if r[2] is not None else 0.0,
-                "r_k": float(r[3]) if r[3] is not None else 0.0,
-                "k_k": float(r[4]) if r[4] is not None else 0.0,
-                "epsilon_k": float(r[5]) if r[5] is not None else 0.0,
-                "state_version": int(r[6]) if r[6] is not None else 0,
-                "created_at": r[7],
-            })
-        return rows
-
 
 # ─────────────────────────────────────────────────────────────────────
 # Ensemble State / Model Weights
 # ─────────────────────────────────────────────────────────────────────
 
 def upsert_ensemble_state(conn: Any, rows: list[dict]) -> int:
-    """MERGE into ENSEMBLE_STATE."""
+    """MERGE into ENSEMBLE_STATE (batched)."""
     if not rows:
         return 0
-    import json
-    count = 0
+    sql = """
+    MERGE /*+ NO_PARALLEL(tgt) */ INTO ENSEMBLE_STATE tgt
+    USING DUAL
+    ON (tgt.RUN_ID = :run_id AND tgt.STATION_ID = :sid
+        AND tgt.TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD') AND tgt.TARGET_TYPE = :tt)
+    WHEN MATCHED THEN UPDATE SET
+      F_TK_TOP      = :f_tk_top,
+      TOP_MODEL_ID  = :tmid,
+      F_BAR_TK      = :f_bar,
+      S_TK          = :s_tk,
+      S_WEIGHTED_TK = :s_w,
+      SIGMA_EFF     = :sigma_eff,
+      M_K           = :m_k,
+      WEIGHT_JSON   = :wj,
+      STALE_MODEL_IDS = :stale
+    WHEN NOT MATCHED THEN INSERT (
+      RUN_ID, STATION_ID, TARGET_DATE, TARGET_TYPE,
+      F_TK_TOP, TOP_MODEL_ID, F_BAR_TK, S_TK, S_WEIGHTED_TK,
+      SIGMA_EFF, M_K, WEIGHT_JSON, STALE_MODEL_IDS
+    ) VALUES (
+      :run_id, :sid, TO_DATE(:td, 'YYYY-MM-DD'), :tt,
+      :f_tk_top, :tmid, :f_bar, :s_tk, :s_w,
+      :sigma_eff, :m_k, :wj, :stale
+    )
+    """
+    bind_rows = []
     for r in rows:
-        sql = """
-        MERGE /*+ NO_PARALLEL(tgt) */ INTO ENSEMBLE_STATE tgt
-        USING DUAL
-        ON (tgt.RUN_ID = :run_id AND tgt.STATION_ID = :sid
-            AND tgt.TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD') AND tgt.TARGET_TYPE = :tt)
-        WHEN MATCHED THEN UPDATE SET
-          F_TK_TOP      = :f_tk_top,
-          TOP_MODEL_ID  = :tmid,
-          F_BAR_TK      = :f_bar,
-          S_TK          = :s_tk,
-          S_WEIGHTED_TK = :s_w,
-          SIGMA_EFF     = :sigma_eff,
-          M_K           = :m_k,
-          WEIGHT_JSON   = :wj,
-          STALE_MODEL_IDS = :stale
-        WHEN NOT MATCHED THEN INSERT (
-          RUN_ID, STATION_ID, TARGET_DATE, TARGET_TYPE,
-          F_TK_TOP, TOP_MODEL_ID, F_BAR_TK, S_TK, S_WEIGHTED_TK,
-          SIGMA_EFF, M_K, WEIGHT_JSON, STALE_MODEL_IDS
-        ) VALUES (
-          :run_id, :sid, TO_DATE(:td, 'YYYY-MM-DD'), :tt,
-          :f_tk_top, :tmid, :f_bar, :s_tk, :s_w,
-          :sigma_eff, :m_k, :wj, :stale
-        )
-        """
         wj = json.dumps(r["weight_json"]) if isinstance(r.get("weight_json"), (dict, list)) else r.get("weight_json")
-        with conn.cursor() as cur:
-            cur.execute(sql, {
-                "run_id": r["run_id"], "sid": r["station_id"],
-                "td": str(r["target_date"]), "tt": r["target_type"],
-                "f_tk_top": r.get("f_tk_top"), "tmid": r.get("top_model_id"),
-                "f_bar": r.get("f_bar_tk"), "s_tk": r.get("s_tk"),
-                "s_w": r.get("s_weighted_tk"), "sigma_eff": r.get("sigma_eff"),
-                "m_k": r.get("m_k"), "wj": wj,
-                "stale": r.get("stale_model_ids"),
-            })
-            count += 1
-    return count
+        bind_rows.append({
+            "run_id": r["run_id"], "sid": r["station_id"],
+            "td": str(r["target_date"]), "tt": r["target_type"],
+            "f_tk_top": r.get("f_tk_top"), "tmid": r.get("top_model_id"),
+            "f_bar": r.get("f_bar_tk"), "s_tk": r.get("s_tk"),
+            "s_w": r.get("s_weighted_tk"), "sigma_eff": r.get("sigma_eff"),
+            "m_k": r.get("m_k"), "wj": wj,
+            "stale": r.get("stale_model_ids"),
+        })
+    with conn.cursor() as cur:
+        cur.executemany(sql, bind_rows)
+    return len(bind_rows)
 
 
 def upsert_model_weights(conn: Any, rows: list[dict]) -> int:
@@ -753,18 +728,16 @@ def upsert_model_weights(conn: Any, rows: list[dict]) -> int:
       :w_m, :bss_m, :is_stale, :decay
     )
     """
-    count = 0
+    bind_rows = [{
+        "run_id": r["run_id"], "sid": r["station_id"],
+        "src_id": r["source_id"], "lb": r.get("lead_bracket"),
+        "w_m": r.get("w_m"), "bss_m": r.get("bss_m"),
+        "is_stale": 1 if r.get("is_stale") else 0,
+        "decay": r.get("stale_decay_factor"),
+    } for r in rows]
     with conn.cursor() as cur:
-        for r in rows:
-            cur.execute(sql, {
-                "run_id": r["run_id"], "sid": r["station_id"],
-                "src_id": r["source_id"], "lb": r.get("lead_bracket"),
-                "w_m": r.get("w_m"), "bss_m": r.get("bss_m"),
-                "is_stale": 1 if r.get("is_stale") else 0,
-                "decay": r.get("stale_decay_factor"),
-            })
-            count += 1
-    return count
+        cur.executemany(sql, bind_rows)
+    return len(bind_rows)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -835,7 +808,7 @@ def get_forecast_errors_window(conn: Any, station_id: str, source_id: str | None
 # ─────────────────────────────────────────────────────────────────────
 
 def upsert_shadow_book(conn: Any, rows: list[dict]) -> int:
-    """MERGE into SHADOW_BOOK on TICKER PK."""
+    """MERGE into SHADOW_BOOK on TICKER PK (batched)."""
     if not rows:
         return 0
     sql = """
@@ -865,43 +838,39 @@ def upsert_shadow_book(conn: Any, rows: list[dict]) -> int:
       :metar_trunc, :t_obs_max, :tmid, :run_id
     )
     """
-    count = 0
+    bind_rows = [{
+        "ticker": r["ticker"], "sid": r["station_id"],
+        "td": str(r["target_date"]), "tt": r["target_type"],
+        "bin_lo": r.get("bin_lower"), "bin_hi": r.get("bin_upper"),
+        "mu": r.get("mu"), "sigma_eff": r.get("sigma_eff"),
+        "g1_s": r.get("g1_s"), "alpha_s": r.get("alpha_s"),
+        "xi_s": r.get("xi_s"), "omega_s": r.get("omega_s"),
+        "p_win": r.get("p_win"),
+        "metar_trunc": 1 if r.get("metar_truncated") else 0,
+        "t_obs_max": r.get("t_obs_max"),
+        "tmid": r.get("top_model_id"), "run_id": r.get("pipeline_run_id"),
+    } for r in rows]
     with conn.cursor() as cur:
-        for r in rows:
-            cur.execute(sql, {
-                "ticker": r["ticker"], "sid": r["station_id"],
-                "td": str(r["target_date"]), "tt": r["target_type"],
-                "bin_lo": r.get("bin_lower"), "bin_hi": r.get("bin_upper"),
-                "mu": r.get("mu"), "sigma_eff": r.get("sigma_eff"),
-                "g1_s": r.get("g1_s"), "alpha_s": r.get("alpha_s"),
-                "xi_s": r.get("xi_s"), "omega_s": r.get("omega_s"),
-                "p_win": r.get("p_win"),
-                "metar_trunc": 1 if r.get("metar_truncated") else 0,
-                "t_obs_max": r.get("t_obs_max"),
-                "tmid": r.get("top_model_id"), "run_id": r.get("pipeline_run_id"),
-            })
-            count += 1
-    return count
+        cur.executemany(sql, bind_rows)
+    return len(bind_rows)
 
 
 def insert_shadow_book_history(conn: Any, rows: list[dict]) -> int:
-    """Append-only insert into SHADOW_BOOK_HISTORY."""
+    """Append-only insert into SHADOW_BOOK_HISTORY (batched)."""
     if not rows:
         return 0
     sql = """
     INSERT INTO SHADOW_BOOK_HISTORY (TICKER, P_WIN, MU, SIGMA_EFF, PIPELINE_RUN_ID)
     VALUES (:ticker, :p_win, :mu, :sigma_eff, :run_id)
     """
-    count = 0
+    bind_rows = [{
+        "ticker": r["ticker"], "p_win": r.get("p_win"),
+        "mu": r.get("mu"), "sigma_eff": r.get("sigma_eff"),
+        "run_id": r.get("pipeline_run_id"),
+    } for r in rows]
     with conn.cursor() as cur:
-        for r in rows:
-            cur.execute(sql, {
-                "ticker": r["ticker"], "p_win": r.get("p_win"),
-                "mu": r.get("mu"), "sigma_eff": r.get("sigma_eff"),
-                "run_id": r.get("pipeline_run_id"),
-            })
-            count += 1
-    return count
+        cur.executemany(sql, bind_rows)
+    return len(bind_rows)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1119,70 +1088,68 @@ def upsert_financial_metrics(conn: Any, row: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────
 
 def upsert_best_bets(conn: Any, rows: list[dict]) -> int:
-    """MERGE into BEST_BETS — one row per ticker."""
+    """MERGE into BEST_BETS — one row per ticker (batched)."""
     if not rows:
         return 0
 
-    count = 0
-    for r in rows:
-        import json
-        with conn.cursor() as cur:
-            cur.execute("""
-                MERGE /*+ NO_PARALLEL(tgt) */ INTO BEST_BETS tgt
-                USING DUAL
-                ON (tgt.TICKER = :ticker)
-                WHEN MATCHED THEN UPDATE SET
-                    PIPELINE_RUN_ID = :run_id,
-                    STATION_ID = :sid, TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD'),
-                    TARGET_TYPE = :tt, BIN_LOWER = :bl, BIN_UPPER = :bu,
-                    P_WIN = :pw, CONTRACT_PRICE = :cp, EV_NET = :ev,
-                    EV_THRESHOLD_H = :evth, ORDER_TYPE = :otype,
-                    C_VWAP = :cvwap, C_VWAP_NET = :cvn,
-                    F_STAR = :fstar, F_OP = :fop, F_FINAL = :ffinal,
-                    IBE_COMPOSITE = :ibe, IBE_VETO = :veto, D_SCALE = :dscale,
-                    GAMMA_CONVERGENCE = :gamma,
-                    RANK_WITHIN_STATION_DAY = :rank,
-                    IS_SELECTED_FOR_EXECUTION = :selected,
-                    PIPELINE_RUN_STATUS = :prs,
-                    ALL_GATE_FLAGS_JSON = :gates
-                WHEN NOT MATCHED THEN INSERT (
-                    TICKER, PIPELINE_RUN_ID, STATION_ID, TARGET_DATE, TARGET_TYPE,
-                    BIN_LOWER, BIN_UPPER, P_WIN, CONTRACT_PRICE, EV_NET,
-                    EV_THRESHOLD_H, ORDER_TYPE, C_VWAP, C_VWAP_NET,
-                    F_STAR, F_OP, F_FINAL,
-                    IBE_COMPOSITE, IBE_VETO, D_SCALE, GAMMA_CONVERGENCE,
-                    RANK_WITHIN_STATION_DAY, IS_SELECTED_FOR_EXECUTION,
-                    PIPELINE_RUN_STATUS, ALL_GATE_FLAGS_JSON
-                ) VALUES (
-                    :ticker, :run_id, :sid, TO_DATE(:td, 'YYYY-MM-DD'), :tt,
-                    :bl, :bu, :pw, :cp, :ev,
-                    :evth, :otype, :cvwap, :cvn,
-                    :fstar, :fop, :ffinal,
-                    :ibe, :veto, :dscale, :gamma,
-                    :rank, :selected,
-                    :prs, :gates
-                )
-            """, {
-                "ticker": r["ticker"], "run_id": r.get("pipeline_run_id"),
-                "sid": r.get("station_id"),
-                "td": str(r.get("target_date", ""))[:10],
-                "tt": r.get("target_type"),
-                "bl": r.get("bin_lower"), "bu": r.get("bin_upper"),
-                "pw": r.get("p_win"), "cp": r.get("contract_price"),
-                "ev": r.get("ev_net"), "evth": r.get("ev_threshold_h"),
-                "otype": r.get("order_type"),
-                "cvwap": r.get("c_vwap"), "cvn": r.get("c_vwap_net"),
-                "fstar": r.get("f_star"), "fop": r.get("f_op"),
-                "ffinal": r.get("f_final"),
-                "ibe": r.get("ibe_composite"), "veto": 1 if r.get("ibe_veto") else 0,
-                "dscale": r.get("d_scale"), "gamma": r.get("gamma_convergence"),
-                "rank": r.get("rank_within_station_day"),
-                "selected": 1 if r.get("is_selected_for_execution") else 0,
-                "prs": r.get("pipeline_run_status"),
-                "gates": json.dumps(r.get("gate_flags")) if r.get("gate_flags") else None,
-            })
-            count += 1
-    return count
+    sql = """
+    MERGE /*+ NO_PARALLEL(tgt) */ INTO BEST_BETS tgt
+    USING DUAL
+    ON (tgt.TICKER = :ticker)
+    WHEN MATCHED THEN UPDATE SET
+        PIPELINE_RUN_ID = :run_id,
+        STATION_ID = :sid, TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD'),
+        TARGET_TYPE = :tt, BIN_LOWER = :bl, BIN_UPPER = :bu,
+        P_WIN = :pw, CONTRACT_PRICE = :cp, EV_NET = :ev,
+        EV_THRESHOLD_H = :evth, ORDER_TYPE = :otype,
+        C_VWAP = :cvwap, C_VWAP_NET = :cvn,
+        F_STAR = :fstar, F_OP = :fop, F_FINAL = :ffinal,
+        IBE_COMPOSITE = :ibe, IBE_VETO = :veto, D_SCALE = :dscale,
+        GAMMA_CONVERGENCE = :gamma,
+        RANK_WITHIN_STATION_DAY = :rank,
+        IS_SELECTED_FOR_EXECUTION = :selected,
+        PIPELINE_RUN_STATUS = :prs,
+        ALL_GATE_FLAGS_JSON = :gates
+    WHEN NOT MATCHED THEN INSERT (
+        TICKER, PIPELINE_RUN_ID, STATION_ID, TARGET_DATE, TARGET_TYPE,
+        BIN_LOWER, BIN_UPPER, P_WIN, CONTRACT_PRICE, EV_NET,
+        EV_THRESHOLD_H, ORDER_TYPE, C_VWAP, C_VWAP_NET,
+        F_STAR, F_OP, F_FINAL,
+        IBE_COMPOSITE, IBE_VETO, D_SCALE, GAMMA_CONVERGENCE,
+        RANK_WITHIN_STATION_DAY, IS_SELECTED_FOR_EXECUTION,
+        PIPELINE_RUN_STATUS, ALL_GATE_FLAGS_JSON
+    ) VALUES (
+        :ticker, :run_id, :sid, TO_DATE(:td, 'YYYY-MM-DD'), :tt,
+        :bl, :bu, :pw, :cp, :ev,
+        :evth, :otype, :cvwap, :cvn,
+        :fstar, :fop, :ffinal,
+        :ibe, :veto, :dscale, :gamma,
+        :rank, :selected,
+        :prs, :gates
+    )
+    """
+    bind_rows = [{
+        "ticker": r["ticker"], "run_id": r.get("pipeline_run_id"),
+        "sid": r.get("station_id"),
+        "td": str(r.get("target_date", ""))[:10],
+        "tt": r.get("target_type"),
+        "bl": r.get("bin_lower"), "bu": r.get("bin_upper"),
+        "pw": r.get("p_win"), "cp": r.get("contract_price"),
+        "ev": r.get("ev_net"), "evth": r.get("ev_threshold_h"),
+        "otype": r.get("order_type"),
+        "cvwap": r.get("c_vwap"), "cvn": r.get("c_vwap_net"),
+        "fstar": r.get("f_star"), "fop": r.get("f_op"),
+        "ffinal": r.get("f_final"),
+        "ibe": r.get("ibe_composite"), "veto": 1 if r.get("ibe_veto") else 0,
+        "dscale": r.get("d_scale"), "gamma": r.get("gamma_convergence"),
+        "rank": r.get("rank_within_station_day"),
+        "selected": 1 if r.get("is_selected_for_execution") else 0,
+        "prs": r.get("pipeline_run_status"),
+        "gates": json.dumps(r.get("gate_flags")) if r.get("gate_flags") else None,
+    } for r in rows]
+    with conn.cursor() as cur:
+        cur.executemany(sql, bind_rows)
+    return len(bind_rows)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1191,7 +1158,6 @@ def upsert_best_bets(conn: Any, rows: list[dict]) -> int:
 
 def insert_orderbook_snapshot(conn: Any, row: dict) -> None:
     """INSERT into MARKET_ORDERBOOK_SNAPSHOTS."""
-    import json
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO MARKET_ORDERBOOK_SNAPSHOTS (
@@ -1251,23 +1217,6 @@ def insert_ibe_signal_log(conn: Any, row: dict) -> None:
 # L4: Position Queries
 # ─────────────────────────────────────────────────────────────────────
 
-def get_open_positions(conn: Any, station_id: str | None = None) -> list[dict]:
-    """SELECT open positions, optionally filtered by station."""
-    sql = """
-        SELECT POSITION_ID, TICKER, STATION_ID, TARGET_DATE, TARGET_TYPE,
-               ENTRY_PRICE, CONTRACTS, ORDER_TYPE, STATUS
-        FROM POSITIONS WHERE STATUS = 'OPEN'
-    """
-    binds: dict = {}
-    if station_id:
-        sql += " AND STATION_ID = :sid"
-        binds["sid"] = station_id
-
-    with conn.cursor() as cur:
-        cur.execute(sql, binds)
-        cols = [c[0].lower() for c in cur.description]
-        return [dict(zip(cols, row)) for row in cur]
-
 
 def get_previous_shadow_book(conn: Any, ticker: str) -> dict | None:
     """Get previous Shadow Book entry for MPDS computation."""
@@ -1297,7 +1246,6 @@ def insert_system_alert(conn: Any, alert: dict) -> None:
       :aid, :atype, :sid, :src_id, :sev, :details
     )
     """
-    import json
     with conn.cursor() as cur:
         cur.execute(sql, {
             "aid": new_run_id(),
@@ -1308,68 +1256,3 @@ def insert_system_alert(conn: Any, alert: dict) -> None:
             "details": json.dumps(alert.get("details")) if alert.get("details") else None,
         })
 
-def get_backfill_coverage(
-    conn: Any,
-    start_date: str,
-    end_date: str,
-) -> dict:
-    """Return what backfill data already exists in the DB for the given window.
-
-    Used by the orchestrator to skip already-loaded dates (idempotency).
-
-    Returns:
-        {
-          "observation_dates": set of "YYYY-MM-DD" strings,
-          "forecast_dates": dict[source_id -> set of "YYYY-MM-DD"],
-          "error_dates": set of "YYYY-MM-DD" strings,
-          "kalman_dates": set of "YYYY-MM-DD" strings,
-        }
-    """
-    # Observation dates with at least one station covered
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT DISTINCT TO_CHAR(TARGET_DATE, 'YYYY-MM-DD')
-            FROM OBSERVATIONS
-            WHERE TARGET_DATE BETWEEN TO_DATE(:s, 'YYYY-MM-DD')
-                                  AND TO_DATE(:e, 'YYYY-MM-DD')
-        """, {"s": start_date, "e": end_date})
-        obs_dates = {row[0] for row in cur}
-
-    # Forecast dates per source_id (via FORECAST_RUNS join)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT DISTINCT fr.SOURCE_ID, TO_CHAR(fd.TARGET_DATE, 'YYYY-MM-DD')
-            FROM FORECASTS_DAILY fd
-            JOIN FORECAST_RUNS fr ON fr.RUN_ID = fd.RUN_ID
-            WHERE fd.TARGET_DATE BETWEEN TO_DATE(:s, 'YYYY-MM-DD')
-                                     AND TO_DATE(:e, 'YYYY-MM-DD')
-        """, {"s": start_date, "e": end_date})
-        fc_dates: dict[str, set] = {}
-        for src, d in cur:
-            fc_dates.setdefault(src, set()).add(d)
-
-    # Error dates (any source)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT DISTINCT TO_CHAR(TARGET_DATE, 'YYYY-MM-DD')
-            FROM FORECAST_ERRORS
-            WHERE TARGET_DATE BETWEEN TO_DATE(:s, 'YYYY-MM-DD')
-                                  AND TO_DATE(:e, 'YYYY-MM-DD')
-        """, {"s": start_date, "e": end_date})
-        err_dates = {row[0] for row in cur}
-
-    # Kalman dates (last observation date per state)
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT DISTINCT TO_CHAR(LAST_OBSERVATION_DATE, 'YYYY-MM-DD')
-            FROM KALMAN_STATES
-            WHERE LAST_OBSERVATION_DATE IS NOT NULL
-        """)
-        kalman_dates = {row[0] for row in cur if row[0]}
-
-    return {
-        "observation_dates": obs_dates,
-        "forecast_dates": fc_dates,
-        "error_dates": err_dates,
-        "kalman_dates": kalman_dates,
-    }

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import math
-import statistics
 from typing import Any
 
 from kalshicast.config.params_bootstrap import get_param_int, get_param_float
@@ -24,27 +23,6 @@ def compute_per_model_rmse(errors: list[float]) -> float:
         return 0.0
     return math.sqrt(sum(e * e for e in errors) / len(errors))
 
-
-def compute_global_rmse(station_rmses: dict[str, float]) -> float:
-    """Global RMSE: median of station-level RMSEs with outlier exclusion.
-
-    Outlier: > 2 × rolling mean. Use median (robust to outliers).
-    """
-    values = [v for v in station_rmses.values() if v > 0]
-    if not values:
-        return SIGMA_FLOOR
-
-    if len(values) == 1:
-        return values[0]
-
-    # Outlier exclusion: remove > 2× median
-    med = statistics.median(values)
-    filtered = [v for v in values if v <= 2.0 * med]
-
-    if not filtered:
-        return med
-
-    return statistics.median(filtered)
 
 
 def bayesian_shrinkage(station_rmse: float, global_rmse: float,

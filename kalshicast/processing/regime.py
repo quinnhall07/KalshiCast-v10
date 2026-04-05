@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any
-
 from kalshicast.config.params_bootstrap import get_param_float, get_param_int
 
 log = logging.getLogger(__name__)
@@ -135,35 +133,3 @@ def detect_bimodal(forecasts: list[float], s_tk: float) -> dict | None:
     return result
 
 
-def flag_regime(conn: Any, station_id: str, target_type: str,
-                target_date: str, bimodal: dict, run_id: str) -> None:
-    """Write bimodal regime detection result to REGIME_FLAGS table."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            MERGE INTO REGIME_FLAGS tgt
-            USING DUAL ON (
-                tgt.STATION_ID = :sid AND tgt.TARGET_TYPE = :tt
-                AND tgt.TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD')
-            )
-            WHEN MATCHED THEN UPDATE SET
-                IS_BIMODAL = 1,
-                CENTROID_1 = :c1, CENTROID_2 = :c2,
-                CLUSTER_SIZE_1 = :s1, CLUSTER_SIZE_2 = :s2,
-                IQR_RATIO = :iqr, CENTROID_DISTANCE = :dist,
-                PIPELINE_RUN_ID = :rid,
-                UPDATED_AT = SYSTIMESTAMP
-            WHEN NOT MATCHED THEN INSERT (
-                STATION_ID, TARGET_TYPE, TARGET_DATE, IS_BIMODAL,
-                CENTROID_1, CENTROID_2, CLUSTER_SIZE_1, CLUSTER_SIZE_2,
-                IQR_RATIO, CENTROID_DISTANCE, PIPELINE_RUN_ID
-            ) VALUES (
-                :sid, :tt, TO_DATE(:td, 'YYYY-MM-DD'), 1,
-                :c1, :c2, :s1, :s2, :iqr, :dist, :rid
-            )
-        """, {
-            "sid": station_id, "tt": target_type, "td": target_date,
-            "c1": bimodal["centroid_1"], "c2": bimodal["centroid_2"],
-            "s1": bimodal["cluster_size_1"], "s2": bimodal["cluster_size_2"],
-            "iqr": bimodal["iqr_ratio"], "dist": bimodal["centroid_distance"],
-            "rid": run_id,
-        })

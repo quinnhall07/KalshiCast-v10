@@ -272,10 +272,3 @@ def get_stations(*, active_only: bool = True) -> list[dict[str, Any]]:
     if active_only:
         return [s for s in STATIONS if s.get("is_active")]
     return list(STATIONS)
-
-
-def get_station(station_id: str) -> dict[str, Any]:
-    for s in STATIONS:
-        if s["station_id"] == station_id:
-            return s
-    raise KeyError(f"Unknown station: {station_id}")

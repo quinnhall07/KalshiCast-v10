@@ -14,6 +14,7 @@ from requests.adapters import HTTPAdapter
 
 from kalshicast.config import HEADERS
 from kalshicast.config.params_bootstrap import get_param_int, get_param_float
+from kalshicast.collection.collectors.base import reindex_axis, backfill_daily_from_hourly_temps
 from kalshicast.collection.time_axis import (
     axis_start_end,
     build_hourly_axis_z,
@@ -127,38 +128,6 @@ def _get_with_retries(url: str, *, params: Dict[str, Any]) -> dict:
     raise last  # pragma: no cover
 
 
-def _reindex_axis(axis: List[str], m: Dict[str, float]) -> List[Optional[float]]:
-    return [float(m[t]) if t in m else None for t in axis]
-
-
-def _backfill_daily_from_hourly_temps(
-    target_dates: List[str],
-    axis: List[str],
-    temps: List[Optional[float]],
-    by_date: Dict[str, Dict[str, Optional[float]]],
-) -> None:
-    if not axis or not temps or len(axis) != len(temps):
-        return
-
-    per: Dict[str, List[float]] = {}
-    for t, v in zip(axis, temps):
-        if v is None:
-            continue
-        d = t[:10]
-        if d in target_dates:
-            per.setdefault(d, []).append(float(v))
-
-    for d in target_dates:
-        rec = by_date.setdefault(d, {"high_f": None, "low_f": None})
-        vals = per.get(d) or []
-        if not vals:
-            continue
-        if rec.get("high_f") is None:
-            rec["high_f"] = max(vals)
-        if rec.get("low_f") is None:
-            rec["low_f"] = min(vals)
-
-
 def _find_ome_key(data_dict: dict, base_var: str) -> str:
     """
     Open-Meteo dynamically appends model names to keys when the 'models' parameter is used.
@@ -253,7 +222,7 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
 
     hourly_out: Dict[str, Any] = {"time": axis}
     for var in _HOURLY_VARS:
-        hourly_out[var] = _reindex_axis(axis, var_maps.get(var) or {})
+        hourly_out[var] = reindex_axis(axis, var_maps.get(var) or {})
 
     # BACKWARD COMPATIBILITY: Ensure the downstream ETL script still finds the data
     # if it specifically maps 'dewpoint_2m' to the 'dewpoint_f' database column.
@@ -286,7 +255,7 @@ def fetch_ome_model_forecast(station: dict, params: Optional[Dict[str, Any]] = N
             by_date[td]["low_f"] = float(lo)
 
     if any((by_date[d]["high_f"] is None or by_date[d]["low_f"] is None) for d in target_dates):
-        _backfill_daily_from_hourly_temps(target_dates, axis, hourly_out["temperature_2m"], by_date)
+        backfill_daily_from_hourly_temps(target_dates, axis, hourly_out["temperature_2m"], by_date)
 
     daily_rows: List[Dict[str, Any]] = []
     for td in target_dates:

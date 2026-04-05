@@ -11,52 +11,24 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any
 
-from kalshicast.config.params_bootstrap import get_param_int, load_db_overrides
-from kalshicast.db.connection import init_db, get_conn, close_pool
-from kalshicast.db.schema import ensure_schema, seed_config_tables
-from kalshicast.db.operations import (
-    new_run_id, insert_pipeline_run, update_pipeline_run,
-    load_all_params,
-)
+from kalshicast.config.params_bootstrap import get_param_int
+from kalshicast.db.connection import get_conn, close_pool
+from kalshicast.db.operations import update_pipeline_run
+from kalshicast.pipeline import pipeline_init, RUN_NIGHT, STATUS_OK, STATUS_ERROR
 
 log = logging.getLogger(__name__)
 
 
 def main() -> None:
     """Night pipeline — 13-step execution sequence."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
-
-    # Step 1: init_db + PIPELINE_RUNS
-    init_db()
-    conn = get_conn()
-    try:
-        ensure_schema(conn)
-        seed_config_tables(conn)
-    finally:
-        conn.close()
-
-    pipeline_run_id = new_run_id()
-    conn = get_conn()
-    try:
-        insert_pipeline_run(conn, pipeline_run_id, "night")
-        conn.commit()
-    finally:
-        conn.close()
-
-    # Step 2: load_params
-    conn = get_conn()
-    try:
-        db_params = load_all_params(conn)
-        load_db_overrides(db_params)
-    finally:
-        conn.close()
+    pipeline_run_id, _ = pipeline_init(RUN_NIGHT)
 
     # Target date: yesterday in US Eastern Time
     now_est = datetime.now(ZoneInfo("America/New_York"))
     target_date = (now_est.date() - timedelta(days=1)).isoformat()
     log.info("Night pipeline for target_date=%s (run_id=%s)", target_date, pipeline_run_id[:8])
 
-    status = "OK"
+    status = STATUS_OK
     error_msg = None
     steps_ok = 0
 
@@ -75,10 +47,10 @@ def main() -> None:
             log.warning("Step 3 WARN: observation fetch failed: %s", e)
 
         # Step 3b: settle paper positions now that observations are available
-         try:
-             from kalshicast.pipeline.paper_sim import settle_paper_positions
-             n_paper_settled = settle_paper_positions(conn)
-             log.info("Step 3b OK: %d paper positions settled", n_paper_settled)
+        try:
+            from kalshicast.pipeline.paper_sim import settle_paper_positions
+            n_paper_settled = settle_paper_positions(conn)
+            log.info("Step 3b OK: %d paper positions settled", n_paper_settled)
         except Exception as e:
             log.warning("Step 3b WARN: paper settlement failed: %s", e)
 
@@ -134,7 +106,7 @@ def main() -> None:
         try:
             from kalshicast.evaluation.brier import grade_brier_scores
             n_graded = grade_brier_scores(conn, target_date)
-            conn.commit()  # <--- Add this missing commit
+            conn.commit()
             steps_ok += 1
             log.info("Step 9 OK: %d Brier scores graded", n_graded)
         except Exception as e:
@@ -182,7 +154,7 @@ def main() -> None:
 
     except Exception as e:
         log.exception("Night pipeline failed: %s", e)
-        status = "ERROR"
+        status = STATUS_ERROR
         error_msg = str(e)[:2000]
         try:
             update_pipeline_run(conn, pipeline_run_id, status=status,

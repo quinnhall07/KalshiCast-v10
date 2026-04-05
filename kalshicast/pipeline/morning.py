@@ -13,24 +13,21 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 from kalshicast.config import HEADERS, get_stations
-from kalshicast.config.params_bootstrap import get_param_int, load_db_overrides
+from kalshicast.config.params_bootstrap import get_param_int
 from kalshicast.collection.sources_registry import load_fetchers_safe
 from kalshicast.collection.time_axis import truncate_issued_at_to_hour_z
 from kalshicast.collection.lead_time import compute_lead_hours, classify_lead_hours
 from kalshicast.collection.collector_harness import call_with_retry
 from kalshicast.config.sources import SOURCES
-from kalshicast.db.connection import init_db, get_conn, close_pool
-from kalshicast.db.schema import ensure_schema, seed_config_tables
+from kalshicast.db.connection import get_conn, close_pool
 from kalshicast.db.operations import (
-    new_run_id,
     upsert_station,
     get_or_create_forecast_run,
     bulk_upsert_forecasts_daily,
     bulk_upsert_forecasts_hourly,
-    insert_pipeline_run,
     update_pipeline_run,
-    load_all_params,
 )
+from kalshicast.pipeline import pipeline_init, RUN_MORNING
 
 log = logging.getLogger(__name__)
 
@@ -168,20 +165,7 @@ def _fetch_one(st: dict, source_id: str, fetcher, provider_group: str):
 # ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
-
-    # Initialize DB and schema
-    init_db()
-    conn = get_conn()
-    try:
-        ensure_schema(conn)
-        seed_config_tables(conn)
-
-        # Load DB param overrides
-        db_params = load_all_params(conn)
-        load_db_overrides(db_params)
-    finally:
-        conn.close()
+    pipeline_run_id, _ = pipeline_init(RUN_MORNING)
 
     stations = get_stations(active_only=True)
 
@@ -204,9 +188,6 @@ def main() -> None:
     global_issued_at = truncate_issued_at_to_hour_z(datetime.now(timezone.utc))
     log.info("Locked pipeline time anchor at: %s", global_issued_at)
 
-    # Pipeline run heartbeat
-    pipeline_run_id = new_run_id()
-
     total_daily = 0
     total_hourly = 0
     stations_ok = 0
@@ -214,9 +195,6 @@ def main() -> None:
 
     conn = get_conn()
     try:
-        insert_pipeline_run(conn, pipeline_run_id, "morning")
-        conn.commit()
-
         # Pre-cache run_ids (eliminates 180 redundant DB round-trips)
         run_id_cache: Dict[str, str] = {}
         for source_id in fetchers:

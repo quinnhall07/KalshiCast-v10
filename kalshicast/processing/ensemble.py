@@ -23,10 +23,12 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────
 
 def select_top_model(conn: Any, station_id: str, lead_bracket: str,
-                     target_type: str) -> str | None:
+                     target_type: str,
+                     kalman_state: dict | None = None) -> str | None:
     """Select the model with highest BSS for this cell. §5.5.2.
 
     Returns source_id or None if BSS matrix empty (cold start).
+    Pass kalman_state to avoid a redundant DB query.
     """
     from kalshicast.db.operations import get_bss_for_cell
 
@@ -34,10 +36,10 @@ def select_top_model(conn: Any, station_id: str, lead_bracket: str,
     if cell is None or cell.get("bss_1") is None:
         return None  # cold start — caller uses fallback
 
-    # For the full version, we'd query per-model BSS.
-    # With the aggregate BSS matrix, return the top_model_id from KALMAN_STATES
-    from kalshicast.db.operations import get_kalman_state
-    ks = get_kalman_state(conn, station_id, target_type)
+    ks = kalman_state
+    if ks is None:
+        from kalshicast.db.operations import get_kalman_state
+        ks = get_kalman_state(conn, station_id, target_type)
     if ks and ks.get("top_model_id"):
         return ks["top_model_id"]
 
@@ -270,8 +272,11 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
             lb = fc0.get("lead_bracket_high") if target_type == "HIGH" else fc0.get("lead_bracket_low")
             lb = lb or "h2"
 
+            # Pre-fetch Kalman state (used by both top model selection and bias correction)
+            ks = get_kalman_state(conn, station_id, target_type)
+
             # Top model selection (cold start → first source or lowest error)
-            top_model = select_top_model(conn, station_id, lb, target_type)
+            top_model = select_top_model(conn, station_id, lb, target_type, kalman_state=ks)
             if top_model is None or top_model not in source_forecasts:
                 top_model = source_ids[0]  # fallback: first available
 
@@ -306,7 +311,6 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
             sigma_eff = compute_sigma_eff(sigma_adj, s_weighted)
 
             # Kalman-corrected μ
-            ks = get_kalman_state(conn, station_id, target_type)
             b_k = ks["b_k"] if ks else 0.0
             mu = f_top + b_k  # bias correction: μ = f_top + B_k
 
