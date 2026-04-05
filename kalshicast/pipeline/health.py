@@ -155,6 +155,15 @@ def run_health_check(conn: Any) -> dict:
         "stale_count": len(stale_stations),
         "stations": stale_stations[:10],
     }
+    if len(stale_stations) >= 5:
+        insert_system_alert(conn, {
+            "alert_type": "METAR_STALE_BULK",
+            "severity_score": 0.65,
+            "details": {
+                "stale_count": len(stale_stations),
+                "stations": stale_stations[:10],
+            },
+        })
 
     # MDD status
     mdd = check_mdd_status(conn)

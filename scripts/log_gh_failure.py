@@ -43,10 +43,11 @@ def main():
             # 2. Fix stuck "RUNNING" ghost runs
             # This closes out the run that was forcefully killed by GitHub
             cur.execute("""
-                UPDATE pipeline_runs 
-                SET status = 'ERROR', 
-                    error_msg = 'Process forcefully terminated by GitHub Action timeout/cancellation.'
-                WHERE pipeline_type = :wf AND status = 'RUNNING'
+                UPDATE PIPELINE_RUNS
+                SET STATUS = 'ERROR',
+                    COMPLETED_UTC = SYSTIMESTAMP,
+                    ERROR_MSG = 'Process forcefully terminated by GitHub Action timeout/cancellation.'
+                WHERE RUN_TYPE = :wf AND STATUS = 'RUNNING'
             """, {"wf": workflow_name})
             
         conn.commit()

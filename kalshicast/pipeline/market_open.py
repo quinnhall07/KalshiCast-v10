@@ -19,7 +19,7 @@ from kalshicast.config.params_bootstrap import get_param_int, get_param_float, g
 from kalshicast.db.connection import get_conn, close_pool
 from kalshicast.db.operations import (
     update_pipeline_run, upsert_best_bets, insert_orderbook_snapshot,
-    insert_ibe_signal_log, get_previous_shadow_book,
+    insert_ibe_signal_log, get_previous_shadow_book, insert_system_alert,
 )
 from kalshicast.pipeline import pipeline_init, RUN_MARKET_OPEN, STATUS_OK, STATUS_PARTIAL, STATUS_ERROR
 
@@ -106,6 +106,23 @@ def main() -> None:
         except Exception as e:
             log.error("Step 6 ERROR: ensemble computation failed: %s", e)
             status = STATUS_PARTIAL
+            insert_system_alert(conn, {
+                "alert_type": "ENSEMBLE_COMPUTATION_FAILED",
+                "severity_score": 0.85,
+                "details": {"error": str(e)[:300], "pipeline_run_id": pipeline_run_id},
+            })
+            conn.commit()
+
+        if total_ensemble == 0:
+            insert_system_alert(conn, {
+                "alert_type": "ENSEMBLE_NO_DATA",
+                "severity_score": 0.8,
+                "details": {
+                    "error": "Ensemble computation produced zero states — no forecast data available.",
+                    "target_dates": target_dates,
+                },
+            })
+            conn.commit()
 
         # Step 7: price_shadow_book
         try:
@@ -118,6 +135,12 @@ def main() -> None:
         except Exception as e:
             log.error("Step 7 ERROR: shadow book pricing failed: %s", e)
             status = STATUS_PARTIAL
+            insert_system_alert(conn, {
+                "alert_type": "SHADOW_BOOK_PRICING_FAILED",
+                "severity_score": 0.8,
+                "details": {"error": str(e)[:300], "pipeline_run_id": pipeline_run_id},
+            })
+            conn.commit()
 
         # Step 7.5: create_paper_positions (paper mode only)
         # Converts IS_SELECTED_FOR_EXECUTION BEST_BETS → PAPER_OPEN POSITIONS
@@ -186,9 +209,27 @@ def main() -> None:
                     log.info("Step 10 OK: %d orders submitted, %d filled, %d skipped, %d errors",
                              summary.get("submitted", 0), summary.get("filled", 0),
                              summary.get("skipped", 0), summary.get("errors", 0))
+                    if summary.get("errors", 0) > 0:
+                        insert_system_alert(conn, {
+                            "alert_type": "ORDER_SUBMISSION_ERRORS",
+                            "severity_score": 0.7,
+                            "details": {
+                                "submitted": summary.get("submitted", 0),
+                                "filled": summary.get("filled", 0),
+                                "errors": summary.get("errors", 0),
+                                "skipped": summary.get("skipped", 0),
+                            },
+                        })
+                        conn.commit()
                 except Exception as e:
                     log.error("Step 10 ERROR: order submission failed: %s", e)
                     status = STATUS_PARTIAL
+                    insert_system_alert(conn, {
+                        "alert_type": "ORDER_SUBMISSION_CRASHED",
+                        "severity_score": 0.9,
+                        "details": {"error": str(e)[:300], "pipeline_run_id": pipeline_run_id},
+                    })
+                    conn.commit()
         else:
             log.info("Steps 8-10: SKIPPED (%s mode — no market fetch, gates, or orders)", mode_str)
 
@@ -212,6 +253,11 @@ def main() -> None:
         status = STATUS_ERROR
         error_msg = str(e)[:2000]
         try:
+            insert_system_alert(conn, {
+                "alert_type": "PIPELINE_MARKET_OPEN_CRASH",
+                "severity_score": 0.95,
+                "details": {"error": str(e)[:500], "mode": mode_str},
+            })
             update_pipeline_run(conn, pipeline_run_id, status=status,
                                 error_msg=error_msg)
             conn.commit()
