@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import pandas as pd
 import numpy as np
 import xgboost as xgb
@@ -67,6 +68,18 @@ def run_stacked_backtest(station_id: str):
         log.info(f"LightGBM Only:          {mae_lgb:.3f}°F ({(mae_raw-mae_lgb)/mae_raw:+.1%})")
         log.info(f"Simple Stack (50/50):   {mae_simple:.3f}°F ({(mae_raw-mae_simple)/mae_raw:+.1%})")
         log.info(f"Optimum Weighted Blend: {min_mae:.3f}°F ({(mae_raw-min_mae)/mae_raw:+.1%}) -> (Weight: {best_w:.1f} XGB)")
+
+        # Persist optimal blend weight for production use
+        weight_path = os.path.join(os.path.dirname(xgb_path), "blend_weight.json")
+        with open(weight_path, 'w') as f:
+            json.dump({
+                'xgb_weight': round(best_w, 2),
+                'lgbm_weight': round(1 - best_w, 2),
+                'holdout_mae': round(min_mae, 4),
+                'raw_gfs_mae': round(mae_raw, 4),
+                'improvement_pct': round((mae_raw - min_mae) / mae_raw * 100, 2),
+            }, f, indent=4)
+        log.info(f"  💾 Saved blend weight to {weight_path}")
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")

@@ -68,11 +68,12 @@ def compute_sigma_for_pricing(conn: Any, station_id: str, target_type: str,
 
     1. Fetch Kalman-corrected errors (use ERROR_ADJUSTED if available, else ERROR_RAW)
     2. Compute station-level RMSE
-    3. Compute global RMSE across all stations
+    3. Compute global RMSE across all stations for same (type, bracket)
     4. Apply Bayesian shrinkage
     5. Return σ_adj (floored at SIGMA_FLOOR if zero)
     """
     from kalshicast.db.operations import get_forecast_errors_window
+    from kalshicast.config import get_stations
 
     window = get_param_int("sigma.rmse_window_days")
     m_prior = get_param_int("sigma.m_prior")
@@ -97,9 +98,27 @@ def compute_sigma_for_pricing(conn: Any, station_id: str, target_type: str,
     if station_rmse == 0:
         return SIGMA_FLOOR
 
-    # For global RMSE we'd need all stations — approximate with just this station
-    # Full implementation would query all stations; for now use station RMSE directly
-    # with shrinkage toward SIGMA_FLOOR as global estimate
-    sigma_adj = bayesian_shrinkage(station_rmse, SIGMA_FLOOR, len(errors), m_prior)
+    # Compute global RMSE across all stations for the same (type, bracket)
+    stations = get_stations(active_only=True)
+    station_rmses: dict[str, float] = {}
+    for st in stations:
+        sid = st["station_id"]
+        if sid == station_id:
+            station_rmses[sid] = station_rmse
+            continue
+        rows = get_forecast_errors_window(
+            conn, sid, None, target_type, lead_bracket, window
+        )
+        errs = []
+        for e in rows:
+            val = e.get("error_adjusted") if e.get("error_adjusted") is not None else e.get("error_raw")
+            if val is not None:
+                errs.append(float(val))
+        if errs:
+            station_rmses[sid] = compute_per_model_rmse(errs)
+
+    global_rmse = compute_global_rmse(station_rmses) if station_rmses else SIGMA_FLOOR
+
+    sigma_adj = bayesian_shrinkage(station_rmse, global_rmse, len(errors), m_prior)
 
     return max(sigma_adj, 0.1)  # never return zero

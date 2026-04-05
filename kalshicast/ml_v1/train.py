@@ -41,7 +41,7 @@ def train_station_models(station_id, lat, lon):
         m_xgb.fit(train[feat], train[target])
         m_xgb.save_model(xgb_path)
         
-        m_lgbm = lgb.LGBMRegressor(**params['lgbm'], verbose=-1)
+        m_lgbm = lgb.LGBMRegressor(**params['lgbm'])
         m_lgbm.fit(train[feat], train[target])
         m_lgbm.booster_.save_model(lgbm_path)
         

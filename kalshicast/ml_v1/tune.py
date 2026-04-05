@@ -22,58 +22,77 @@ def tune_xgb(X_train, y_train, X_valid, y_valid):
         params = {
             'max_depth': trial.suggest_int('max_depth', 3, 10),
             'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.1, log=True),
-            'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+            'n_estimators': 2000,
             'subsample': trial.suggest_float('subsample', 0.6, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'gamma': trial.suggest_float('gamma', 0.0, 5.0),
+            'early_stopping_rounds': 50,
             'random_state': 42,
-            'n_jobs': -1
+            'n_jobs': 2
         }
         model = xgb.XGBRegressor(**params)
         model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
+        trial.set_user_attr('n_estimators', model.best_iteration + 1)
         return mean_absolute_error(y_valid, model.predict(X_valid))
-    
+
     study = optuna.create_study(direction='minimize')
     study.optimize(objective, n_trials=50)
-    return study.best_params
+    best = study.best_params.copy()
+    best['n_estimators'] = study.best_trial.user_attrs['n_estimators']
+    return best
 
 def tune_lgbm(X_train, y_train, X_valid, y_valid):
     def objective(trial):
         params = {
             'num_leaves': trial.suggest_int('num_leaves', 20, 150),
             'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.1, log=True),
-            'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
+            'n_estimators': 2000,
             'min_child_samples': trial.suggest_int('min_child_samples', 5, 50),
             'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 1.0),
             'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 1.0),
             'bagging_freq': trial.suggest_int('bagging_freq', 1, 7),
             'random_state': 42,
+            'n_jobs': 2,
             'verbosity': -1
         }
         model = lgb.LGBMRegressor(**params)
-        model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], callbacks=[lgb.log_evaluation(period=0)])
+        model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)],
+                  callbacks=[lgb.early_stopping(50), lgb.log_evaluation(period=0)])
+        trial.set_user_attr('n_estimators', model.best_iteration_ + 1)
         return mean_absolute_error(y_valid, model.predict(X_valid))
 
     study = optuna.create_study(direction='minimize')
     study.optimize(objective, n_trials=50)
-    return study.best_params
+    best = study.best_params.copy()
+    best['n_estimators'] = study.best_trial.user_attrs['n_estimators']
+    return best
 
 def run_tuning(station_id, lat, lon):
     log.info(f"🧬 Tuning {CURRENT_VERSION} for {station_id}...")
     df = fetch_bootstrap_data(station_id, lat, lon)
     if df.empty: return
-    
+
     df = df.sort_values('time')
-    split = int(len(df) * 0.8)
-    train, valid = df.iloc[:split], df.iloc[split:]
-    
+    n = len(df)
+    tune_end = int(n * 0.6)
+    valid_end = int(n * 0.8)
+    train = df.iloc[:tune_end]
+    valid = df.iloc[tune_end:valid_end]
+
     for t_type in ['HIGH', 'LOW']:
         feat = FEATURES[t_type]
         target = f'target_error_{t_type.lower()}'
-        
+
         best_xgb = tune_xgb(train[feat], train[target], valid[feat], valid[target])
         best_lgbm = tune_lgbm(train[feat], train[target], valid[feat], valid[target])
-        
+
+        # Persist complete params including fixed settings
+        best_xgb['random_state'] = 42
+        best_xgb['n_jobs'] = 2
+        best_lgbm['random_state'] = 42
+        best_lgbm['n_jobs'] = 2
+        best_lgbm['verbosity'] = -1
+
         param_path = os.path.join(os.path.dirname(get_model_path(station_id, t_type, "json")), "params.json")
         with open(param_path, 'w') as f:
             json.dump({'xgb': best_xgb, 'lgbm': best_lgbm}, f, indent=4)
