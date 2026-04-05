@@ -184,6 +184,18 @@ def main() -> None:
                     },
                 })
 
+        # Catch-all alert for non-OK runs
+        if status != STATUS_OK:
+            insert_system_alert(conn, {
+                "alert_type": f"PIPELINE_NIGHT_{status}",
+                "severity_score": 0.8 if status == STATUS_ERROR else 0.6,
+                "details": {
+                    "pipeline_run_id": pipeline_run_id,
+                    "status": status,
+                    "steps_ok": steps_ok,
+                },
+            })
+
         # Step 13: update_pipeline_run
         update_pipeline_run(
             conn, pipeline_run_id,

@@ -121,6 +121,22 @@ def settle_positions(conn: Any) -> int:
     return count
 
 
+def purge_resolved_alerts(conn: Any) -> int:
+    """Delete resolved alerts older than alerts.retention_days."""
+    from kalshicast.config.params_bootstrap import get_param_int
+    retention = get_param_int("alerts.retention_days", default=7)
+    with conn.cursor() as cur:
+        cur.execute("""
+            DELETE FROM SYSTEM_ALERTS
+            WHERE IS_RESOLVED = 1
+              AND RESOLVED_TS < SYSTIMESTAMP - NUMTODSINTERVAL(:days, 'DAY')
+        """, {"days": retention})
+        count = cur.rowcount or 0
+    conn.commit()
+    log.info("[rollover] purged %d resolved alerts (retention=%d days)", count, retention)
+    return count
+
+
 def run_rollover(conn: Any) -> dict:
     """Master rollover sequence — run at start of each day."""
     from kalshicast.pipeline.paper_sim import settle_paper_positions
@@ -128,10 +144,11 @@ def run_rollover(conn: Any) -> dict:
     today     = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    metar_init    = init_metar_daily_max(conn, today)
-    sb_final      = finalize_shadow_book(conn, yesterday)
-    settled       = settle_positions(conn)
-    paper_settled = settle_paper_positions(conn)
+    metar_init      = init_metar_daily_max(conn, today)
+    sb_final        = finalize_shadow_book(conn, yesterday)
+    settled         = settle_positions(conn)
+    paper_settled   = settle_paper_positions(conn)
+    alerts_purged   = purge_resolved_alerts(conn)
 
     return {
         "date":                    today,
@@ -139,4 +156,5 @@ def run_rollover(conn: Any) -> dict:
         "shadow_book_finalized":   sb_final,
         "positions_settled":       settled,
         "paper_positions_settled": paper_settled,
+        "alerts_purged":           alerts_purged,
     }

@@ -493,6 +493,13 @@ ALL_DDL: list[str] = [
         CONSTRAINT PK_SYSTEM_ALERTS PRIMARY KEY (ALERT_ID)
     )""",
 
+    """CREATE TABLE USER_PREFERENCES (
+        USERNAME          VARCHAR2(100) NOT NULL,
+        PREFERENCES_JSON  CLOB,
+        UPDATED_AT        TIMESTAMP(6) DEFAULT SYSTIMESTAMP,
+        CONSTRAINT PK_USER_PREFERENCES PRIMARY KEY (USERNAME)
+    )""",
+
     """CREATE TABLE PIPELINE_DAY_HEALTH (
         TARGET_DATE          DATE NOT NULL,
         RUN_TS               TIMESTAMP(6),
@@ -648,10 +655,35 @@ def seed_config_tables(conn: Any) -> None:
                 "dt": p.dtype, "desc_val": p.description,
             })
 
-    conn.commit()
-    log.info("Seeded %d stations, %d sources, %d params",
-             len(STATIONS), len(SOURCES), len(PARAM_DEFS))
-    
+    # Seed USER_PREFERENCES for admin users
+    import os
+    default_prefs = json.dumps({
+        "accentColor": "#6366f1",
+        "fontSize": "medium",
+        "darkMode": True,
+        "defaultTab": "dashboard",
+        "compactMode": False,
+        "animations": True,
+        "cardBorderRadius": 12,
+        "topBarMetrics": [
+            "activePositions", "totalPnl", "activeBets",
+            "winRate", "avgBrier", "portfolioValue",
+        ],
+    })
+    for env_key in ("SITE_ADMIN_1", "SITE_ADMIN_2"):
+        uname = os.environ.get(env_key)
+        if uname:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    MERGE INTO USER_PREFERENCES tgt USING DUAL
+                    ON (tgt.USERNAME = :uname)
+                    WHEN NOT MATCHED THEN INSERT (
+                        USERNAME, PREFERENCES_JSON
+                    ) VALUES (
+                        :uname, :prefs
+                    )
+                """, {"uname": uname, "prefs": default_prefs})
+
     conn.commit()
     log.info("Seeded %d stations, %d sources, %d params",
              len(STATIONS), len(SOURCES), len(PARAM_DEFS))

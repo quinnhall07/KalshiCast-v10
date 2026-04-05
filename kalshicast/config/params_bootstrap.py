@@ -168,6 +168,9 @@ PARAM_DEFS: list[ParamDef] = [
     ParamDef("eval.sharpe_min_bets", "20", "int", "Min bets before Sharpe meaningful"),
     ParamDef("eval.adverse_selection_window", "90", "int", "Days for adverse selection test"),
     ParamDef("eval.pattern_check_interval_days", "7", "int", "BSS pattern classifier frequency"),
+
+    # --- Alerts ---
+    ParamDef("alerts.retention_days", "7", "int", "Days to keep resolved alerts before rollover purge"),
 ]
 
 _DEFAULTS: dict[str, ParamDef] = {p.key: p for p in PARAM_DEFS}

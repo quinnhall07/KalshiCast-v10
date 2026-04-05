@@ -336,6 +336,21 @@ def main() -> None:
                 },
             })
 
+        # Catch-all alert for non-OK runs
+        if final_status != "OK":
+            insert_system_alert(conn, {
+                "alert_type": f"PIPELINE_MORNING_{final_status}",
+                "severity_score": 0.8 if final_status == "ERROR" else 0.6,
+                "details": {
+                    "pipeline_run_id": pipeline_run_id,
+                    "status": final_status,
+                    "stations_ok": stations_ok,
+                    "stations_fail": stations_fail,
+                    "rows_daily": total_daily,
+                    "rows_hourly": total_hourly,
+                },
+            })
+
         # Finalize pipeline run
         update_pipeline_run(
             conn, pipeline_run_id,

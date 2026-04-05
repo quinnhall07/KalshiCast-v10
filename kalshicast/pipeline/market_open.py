@@ -158,10 +158,20 @@ def main() -> None:
                     conn, pipeline_run_id,
                     bankroll=1000.0,        # paper bankroll
                     target_dates=target_dates,
+                    paper_mode=True,
                 )
                 from kalshicast.pipeline.paper_sim import create_paper_positions
                 n_paper = create_paper_positions(conn, pipeline_run_id)
                 log.info("Step 7.5 OK: %d paper positions created", n_paper)
+                if n_paper == 0:
+                    insert_system_alert(conn, {
+                        "alert_type": "PAPER_NO_POSITIONS",
+                        "severity_score": 0.4,
+                        "details": {
+                            "pipeline_run_id": pipeline_run_id,
+                            "best_bets_count": len(best_bets_paper),
+                        },
+                    })
             except Exception as e:
                 log.warning("Step 7.5 WARN: paper position creation failed: %s", e)
 
@@ -240,6 +250,20 @@ def main() -> None:
         except Exception as e:
             log.warning("Step 11 WARN: health update failed: %s", e)
 
+        # Catch-all alert for non-OK runs
+        if status != STATUS_OK:
+            insert_system_alert(conn, {
+                "alert_type": f"PIPELINE_MARKET_OPEN_{status}",
+                "severity_score": 0.8 if status == STATUS_ERROR else 0.6,
+                "details": {
+                    "pipeline_run_id": pipeline_run_id,
+                    "status": status,
+                    "mode": mode_str,
+                    "shadow_rows": total_shadow,
+                    "bets_placed": total_bets,
+                },
+            })
+
         # Step 12: update_pipeline_run
         update_pipeline_run(
             conn, pipeline_run_id,
@@ -313,6 +337,7 @@ def _step9_evaluate_gates_ibe(
     pipeline_run_id: str,
     bankroll: float,
     target_dates: list[str],
+    paper_mode: bool = False,
 ) -> list[dict]:
     """Evaluate conviction gates, IBE signals, Kelly sizing for all candidates."""
     from kalshicast.execution.gates import evaluate_all_gates
@@ -321,22 +346,34 @@ def _step9_evaluate_gates_ibe(
     from kalshicast.execution.positions import get_remaining_capacity
 
     # Get Shadow Book candidates with market prices
+    # In paper mode, use P_WIN as synthetic market price (no orderbook data available)
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
-                   sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
-                   sb.TOP_MODEL_ID,
-                   mos.C_VWAP_COMPUTED, mos.AVAILABLE_DEPTH
-            FROM SHADOW_BOOK sb
-            LEFT JOIN (
-                SELECT TICKER, C_VWAP_COMPUTED, AVAILABLE_DEPTH,
-                       ROW_NUMBER() OVER (PARTITION BY TICKER ORDER BY SNAPSHOT_UTC DESC) rn
-                FROM MARKET_ORDERBOOK_SNAPSHOTS
-            ) mos ON mos.TICKER = sb.TICKER AND mos.rn = 1
-            WHERE sb.PIPELINE_RUN_ID = :run_id
-              AND sb.P_WIN IS NOT NULL
-              AND mos.C_VWAP_COMPUTED IS NOT NULL
-        """, {"run_id": pipeline_run_id})
+        if paper_mode:
+            cur.execute("""
+                SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
+                       sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
+                       sb.TOP_MODEL_ID,
+                       sb.P_WIN AS C_VWAP_COMPUTED, 100 AS AVAILABLE_DEPTH
+                FROM SHADOW_BOOK sb
+                WHERE sb.PIPELINE_RUN_ID = :run_id
+                  AND sb.P_WIN IS NOT NULL
+            """, {"run_id": pipeline_run_id})
+        else:
+            cur.execute("""
+                SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
+                       sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
+                       sb.TOP_MODEL_ID,
+                       mos.C_VWAP_COMPUTED, mos.AVAILABLE_DEPTH
+                FROM SHADOW_BOOK sb
+                LEFT JOIN (
+                    SELECT TICKER, C_VWAP_COMPUTED, AVAILABLE_DEPTH,
+                           ROW_NUMBER() OVER (PARTITION BY TICKER ORDER BY SNAPSHOT_UTC DESC) rn
+                    FROM MARKET_ORDERBOOK_SNAPSHOTS
+                ) mos ON mos.TICKER = sb.TICKER AND mos.rn = 1
+                WHERE sb.PIPELINE_RUN_ID = :run_id
+                  AND sb.P_WIN IS NOT NULL
+                  AND mos.C_VWAP_COMPUTED IS NOT NULL
+            """, {"run_id": pipeline_run_id})
 
         candidates = []
         for row in cur:
