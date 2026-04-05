@@ -47,9 +47,12 @@ def _fetch_iem_actuals(cli_site: str, state: str,
                 continue
             resp.raise_for_status()
             break
-        except requests.exceptions.Timeout:
+        except requests.exceptions.HTTPError:
+            raise
+        except requests.exceptions.RequestException as exc:
             wait = 3 ** attempt
-            log.warning("  ⏳ IEM timeout, retrying in %ds...", wait)
+            log.warning("  ⏳ IEM request error (%s), retrying in %ds...",
+                        exc, wait)
             time.sleep(wait)
     else:
         log.error("❌ IEM API failed after 5 attempts for %s", cli_site)
@@ -105,7 +108,7 @@ def fetch_bootstrap_data(station_id: str, lat: float, lon: float,
     )
 
     try:
-        f_resp = requests.get(f_url)
+        f_resp = requests.get(f_url, timeout=(5, 30))
         f_resp.raise_for_status()
         f_df = pd.DataFrame(f_resp.json()["daily"]).rename(columns={
             "temperature_2m_max": "forecast_high",

@@ -227,6 +227,10 @@ def _compute_per_source_skill(conn: Any, station_id: str, target_type: str,
 
     # Need at least 2 sources with data to differentiate
     if len(source_mse) < 2:
+        # With exactly one source we know its performance — give it full skill
+        if len(source_mse) == 1:
+            only_src = next(iter(source_mse))
+            return [1.0 if src == only_src else 0.0 for src in source_ids]
         return [0.0] * len(source_ids)
 
     mse_baseline = max(source_mse.values())
@@ -304,6 +308,7 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
     ensemble_rows = []
     weight_rows = []
     count = 0
+    global_rmse_cache: dict[tuple[str, str], float] = {}
 
     for st in stations:
         station_id = st["station_id"]
@@ -362,7 +367,10 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
             s_unweighted, s_weighted = compute_spread(fc_values, weights)
 
             # Sigma
-            sigma_adj = compute_sigma_for_pricing(conn, station_id, target_type, lb)
+            sigma_adj = compute_sigma_for_pricing(
+                conn, station_id, target_type, lb,
+                global_rmse_cache=global_rmse_cache,
+            )
 
             # Skewness from error history
             errors_for_skew = get_forecast_errors_window(

@@ -27,12 +27,17 @@ def tune_xgb(X_train, y_train, X_valid, y_valid):
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'gamma': trial.suggest_float('gamma', 0.0, 5.0),
             'early_stopping_rounds': 50,
+            'eval_metric': 'mae',
             'random_state': 42,
             'n_jobs': 2
         }
         model = xgb.XGBRegressor(**params)
         model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
-        trial.set_user_attr('n_estimators', model.best_iteration + 1)
+        best_iter = getattr(model, 'best_iteration', None)
+        # best_iteration is None when early stopping never triggers (e.g. all
+        # n_estimators rounds complete without improvement for patience window)
+        n_est = (best_iter + 1) if best_iter is not None else params['n_estimators']
+        trial.set_user_attr('n_estimators', n_est)
         return mean_absolute_error(y_valid, model.predict(X_valid))
 
     study = optuna.create_study(direction='minimize')
