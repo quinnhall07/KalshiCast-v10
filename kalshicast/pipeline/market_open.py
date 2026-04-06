@@ -66,7 +66,6 @@ def main() -> None:
             log.error("Step 3 ERROR: API connection failed: %s", e)
             status = STATUS_PARTIAL
         else:
-            client = None
             log.info("Step 3: paper mode bankroll=$%.2f", bankroll)
 
         # Step 4: fetch_metar
@@ -169,7 +168,7 @@ def main() -> None:
                     conn, pipeline_run_id,
                     bankroll=1000.0,        # paper bankroll
                     target_dates=target_dates,
-                    paper_mode=False,
+                    paper_mode=True,
                 )
                 from kalshicast.pipeline.paper_sim import create_paper_positions
                 n_paper = create_paper_positions(conn, pipeline_run_id)
