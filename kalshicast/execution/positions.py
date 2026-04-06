@@ -18,7 +18,8 @@ def get_open_position_value(conn: Any, *, station_id: str | None = None,
                             target_date: str | None = None,
                             wfo_id: str | None = None) -> float:
     """Sum of (ENTRY_PRICE × CONTRACTS) for open positions, optionally filtered."""
-    conditions = ["p.STATUS = 'OPEN'"]
+    # Update this line to count both live and paper positions
+    conditions = ["p.STATUS IN ('OPEN', 'PAPER_OPEN')"]
     binds: dict = {}
 
     if station_id:
