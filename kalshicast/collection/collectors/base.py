@@ -1,52 +1,51 @@
-"""Abstract collector interface and ForecastBundle type."""
+"""Shared helpers for weather data collectors."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 
-@dataclass
-class DailyRow:
-    target_date: str          # YYYY-MM-DD
-    high_f: float | None
-    low_f: float | None
-    lead_hours_high: float | None = None
-    lead_hours_low: float | None = None
+def to_float(x: Any) -> Optional[float]:
+    """Safely convert a value to float, returning None on failure."""
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
 
 
-@dataclass
-class HourlyRow:
-    valid_time_utc: str       # ISO-8601 UTC
-    temperature_f: float | None = None
-    dewpoint_f: float | None = None
-    humidity_pct: float | None = None
-    wind_speed_mph: float | None = None
-    wind_dir_deg: int | None = None
-    cloud_cover_pct: int | None = None
-    precip_prob_pct: int | None = None
-    precip_type_code: int | None = None
+def reindex_axis(axis: List[str], m: Dict[str, float]) -> List[Optional[float]]:
+    """Map a dict keyed by time-string onto a uniform time axis."""
+    return [float(m[t]) if t in m else None for t in axis]
 
 
-@dataclass
-class ForecastBundle:
-    source_id: str
-    station_id: str
-    issued_at: str            # ISO-8601 UTC
-    init_time: str | None = None
-    daily: list[DailyRow] = field(default_factory=list)
-    hourly: list[HourlyRow] = field(default_factory=list)
+def backfill_daily_from_hourly_temps(
+    target_dates: List[str],
+    axis: List[str],
+    temps: List[Optional[float]],
+    daily_by_date: Dict[str, Dict[str, Optional[float]]],
+) -> None:
+    """Derive daily high/low from hourly temps when daily data is missing."""
+    if not axis or not temps or len(axis) != len(temps):
+        return
 
+    per: Dict[str, List[float]] = {}
+    for t, v in zip(axis, temps):
+        if v is None:
+            continue
+        d = t[:10]
+        if d in target_dates:
+            per.setdefault(d, []).append(float(v))
 
-def validate_bundle(b: ForecastBundle) -> list[str]:
-    """Return list of warnings (empty = valid)."""
-    warnings = []
-    if not b.source_id:
-        warnings.append("missing source_id")
-    if not b.station_id:
-        warnings.append("missing station_id")
-    if not b.issued_at:
-        warnings.append("missing issued_at")
-    if len(b.daily) == 0:
-        warnings.append("no daily rows")
-    return warnings
+    for d in target_dates:
+        rec = daily_by_date.setdefault(d, {"high_f": None, "low_f": None})
+        if rec.get("high_f") is not None and rec.get("low_f") is not None:
+            continue
+        vals = per.get(d) or []
+        if not vals:
+            continue
+        if rec.get("high_f") is None:
+            rec["high_f"] = max(vals)
+        if rec.get("low_f") is None:
+            rec["low_f"] = min(vals)

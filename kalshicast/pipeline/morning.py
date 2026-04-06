@@ -13,24 +13,22 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
 from kalshicast.config import HEADERS, get_stations
-from kalshicast.config.params_bootstrap import get_param_int, load_db_overrides
+from kalshicast.config.params_bootstrap import get_param_int
 from kalshicast.collection.sources_registry import load_fetchers_safe
 from kalshicast.collection.time_axis import truncate_issued_at_to_hour_z
 from kalshicast.collection.lead_time import compute_lead_hours, classify_lead_hours
 from kalshicast.collection.collector_harness import call_with_retry
 from kalshicast.config.sources import SOURCES
-from kalshicast.db.connection import init_db, get_conn, close_pool
-from kalshicast.db.schema import ensure_schema, seed_config_tables
+from kalshicast.db.connection import get_conn, close_pool
 from kalshicast.db.operations import (
-    new_run_id,
     upsert_station,
     get_or_create_forecast_run,
     bulk_upsert_forecasts_daily,
     bulk_upsert_forecasts_hourly,
-    insert_pipeline_run,
     update_pipeline_run,
-    load_all_params,
+    insert_system_alert,
 )
+from kalshicast.pipeline import pipeline_init, RUN_MORNING
 
 log = logging.getLogger(__name__)
 
@@ -168,20 +166,7 @@ def _fetch_one(st: dict, source_id: str, fetcher, provider_group: str):
 # ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
-
-    # Initialize DB and schema
-    init_db()
-    conn = get_conn()
-    try:
-        ensure_schema(conn)
-        seed_config_tables(conn)
-
-        # Load DB param overrides
-        db_params = load_all_params(conn)
-        load_db_overrides(db_params)
-    finally:
-        conn.close()
+    pipeline_run_id, _ = pipeline_init(RUN_MORNING)
 
     stations = get_stations(active_only=True)
 
@@ -198,14 +183,23 @@ def main() -> None:
     fetchers = load_fetchers_safe()
     if not fetchers:
         log.error("No enabled sources loaded.")
+        conn2 = get_conn()
+        try:
+            insert_system_alert(conn2, {
+                "alert_type": "COLLECTION_FAILURE",
+                "severity_score": 0.9,
+                "details": {"error": "No enabled forecast sources loaded — morning pipeline aborted."},
+            })
+            update_pipeline_run(conn2, pipeline_run_id, status="ERROR",
+                                error_msg="No enabled sources loaded")
+            conn2.commit()
+        finally:
+            conn2.close()
         return
 
     # Global timestamp sync — all records share one issued_at
     global_issued_at = truncate_issued_at_to_hour_z(datetime.now(timezone.utc))
     log.info("Locked pipeline time anchor at: %s", global_issued_at)
-
-    # Pipeline run heartbeat
-    pipeline_run_id = new_run_id()
 
     total_daily = 0
     total_hourly = 0
@@ -214,9 +208,6 @@ def main() -> None:
 
     conn = get_conn()
     try:
-        insert_pipeline_run(conn, pipeline_run_id, "morning")
-        conn.commit()
-
         # Pre-cache run_ids (eliminates 180 redundant DB round-trips)
         run_id_cache: Dict[str, str] = {}
         for source_id in fetchers:
@@ -316,10 +307,54 @@ def main() -> None:
                 # Single commit per (station, source) result
                 conn.commit()
 
+        # Detect high failure rate and alert
+        total_tasks = stations_ok + stations_fail
+        fail_rate = stations_fail / total_tasks if total_tasks > 0 else 0
+        final_status = "OK"
+        if fail_rate >= 0.5:
+            final_status = "PARTIAL"
+            insert_system_alert(conn, {
+                "alert_type": "COLLECTION_HIGH_FAILURE_RATE",
+                "severity_score": 0.75,
+                "details": {
+                    "stations_ok": stations_ok,
+                    "stations_fail": stations_fail,
+                    "fail_rate": round(fail_rate, 3),
+                    "rows_daily": total_daily,
+                    "rows_hourly": total_hourly,
+                },
+            })
+        if total_daily == 0:
+            final_status = "ERROR"
+            insert_system_alert(conn, {
+                "alert_type": "COLLECTION_NO_DATA",
+                "severity_score": 0.85,
+                "details": {
+                    "error": "Morning pipeline produced zero daily forecast rows.",
+                    "stations_ok": stations_ok,
+                    "stations_fail": stations_fail,
+                },
+            })
+
+        # Catch-all alert for non-OK runs
+        if final_status != "OK":
+            insert_system_alert(conn, {
+                "alert_type": f"PIPELINE_MORNING_{final_status}",
+                "severity_score": 0.8 if final_status == "ERROR" else 0.6,
+                "details": {
+                    "pipeline_run_id": pipeline_run_id,
+                    "status": final_status,
+                    "stations_ok": stations_ok,
+                    "stations_fail": stations_fail,
+                    "rows_daily": total_daily,
+                    "rows_hourly": total_hourly,
+                },
+            })
+
         # Finalize pipeline run
         update_pipeline_run(
             conn, pipeline_run_id,
-            status="OK",
+            status=final_status,
             stations_ok=stations_ok,
             stations_fail=stations_fail,
             rows_daily=total_daily,
@@ -330,6 +365,11 @@ def main() -> None:
     except Exception as e:
         log.exception("Pipeline failed: %s", e)
         try:
+            insert_system_alert(conn, {
+                "alert_type": "PIPELINE_MORNING_CRASH",
+                "severity_score": 0.95,
+                "details": {"error": str(e)[:500]},
+            })
             update_pipeline_run(
                 conn, pipeline_run_id,
                 status="ERROR",

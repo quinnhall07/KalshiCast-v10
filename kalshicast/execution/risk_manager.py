@@ -3,6 +3,7 @@
 import logging
 from typing import Any
 from kalshicast.config.params_bootstrap import get_param_float, get_param_bool
+from kalshicast.db.operations import insert_system_alert
 
 log = logging.getLogger(__name__)
 
@@ -61,10 +62,20 @@ def evaluate_system_health(conn: Any, bankroll: float) -> bool:
 
     # Trigger alerts if state changed
     if is_offline and not currently_offline:
-        _insert_alert(conn, "SYSTEM_OFFLINE", "CRITICAL", f"Algorithmic trading suspended. Reasons: {reason_str}")
+        insert_system_alert(conn, {
+            "alert_type": "SYSTEM_OFFLINE",
+            "severity_score": 0.95,
+            "details": {"reason": reason_str},
+        })
+        conn.commit()
         log.error("SYSTEM GOING OFFLINE: %s", reason_str)
     elif not is_offline and currently_offline:
-        _insert_alert(conn, "SYSTEM_RECOVERY", "INFO", "Risk parameters normalized. Trading algorithms back online.")
+        insert_system_alert(conn, {
+            "alert_type": "SYSTEM_RECOVERY",
+            "severity_score": 0.1,
+            "details": {"reason": "Risk parameters normalized. Trading algorithms back online."},
+        })
+        conn.commit()
         log.info("SYSTEM RECOVERED: Back online.")
 
     # Save current state to database so the dashboard can read it
@@ -72,18 +83,6 @@ def evaluate_system_health(conn: Any, bankroll: float) -> bool:
     _set_param(conn, "system.offline_reason", reason_str, "str")
 
     return is_offline
-
-def _insert_alert(conn: Any, alert_type: str, severity: str, detail: str) -> None:
-    try:
-        with conn.cursor() as cur:
-            # Note: Depending on your DB schema, you may use SYS_GUID() or another ID generator
-            cur.execute("""
-                INSERT INTO SYSTEM_ALERTS (ID, TYPE, SEVERITY, DETAIL, TS, RESOLVED)
-                VALUES (SYS_GUID(), :at, :sev, :det, SYSTIMESTAMP, 0)
-            """, {"at": alert_type, "sev": severity, "det": detail})
-        conn.commit()
-    except Exception as e:
-        log.error("Failed to insert alert: %s", e)
 
 def _set_param(conn: Any, key: str, value: str, dtype: str) -> None:
     try:

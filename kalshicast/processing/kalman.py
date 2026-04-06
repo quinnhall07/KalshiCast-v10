@@ -193,14 +193,16 @@ def update_kalman_filters(conn: Any, target_date: str, run_id: str) -> int:
                     last_observation_date=state_dict.get("last_observation_date"),
                 )
 
-            # Get the top model's error for this date
-            errors = get_forecast_errors_window(
+            # Fetch recent errors (single query serves both today's error and Q_k innovations)
+            window = get_param_int("sigma.rmse_window_days")
+            recent_errors = get_forecast_errors_window(
                 conn, station_id, state.top_model_id,
-                target_type, "h2", 1,  # today's error, default h2 bracket
+                target_type, "h2", min(window, 30),
             )
-            # Find the error row matching target_date
+
+            # Find today's error from the fetched window
             target_err = None
-            for e in errors:
+            for e in recent_errors:
                 td = e.get("target_date")
                 if td and str(td)[:10] == str(target_date)[:10]:
                     target_err = e
@@ -224,12 +226,7 @@ def update_kalman_filters(conn: Any, target_date: str, run_id: str) -> int:
                 delta = (td_parsed - state.last_observation_date).days - 1
                 gap_days = max(0, delta)
 
-            # Get recent innovations for Q_k
-            window = get_param_int("sigma.rmse_window_days")
-            recent_errors = get_forecast_errors_window(
-                conn, station_id, state.top_model_id,
-                target_type, "h2", min(window, 30),
-            )
+            # Recent innovations for Q_k
             recent_innovations = [
                 float(e["error_raw"]) for e in recent_errors
                 if e.get("error_raw") is not None

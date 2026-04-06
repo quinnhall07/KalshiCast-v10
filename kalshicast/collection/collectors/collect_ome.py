@@ -13,6 +13,7 @@ from requests.adapters import HTTPAdapter
 
 from kalshicast.config import HEADERS
 from kalshicast.config.params_bootstrap import get_param_int, get_param_float
+from kalshicast.collection.collectors.base import reindex_axis, backfill_daily_from_hourly_temps
 from kalshicast.collection.time_axis import (
     axis_start_end,
     build_hourly_axis_z,
@@ -124,38 +125,6 @@ def _ensure_time_hour_z(ts: Any) -> Optional[str]:
         return None
 
 
-def _reindex_axis(axis: List[str], m: Dict[str, float]) -> List[Optional[float]]:
-    return [float(m[t]) if t in m else None for t in axis]
-
-
-def _backfill_daily_from_hourly_temps(
-    target_dates: List[str],
-    axis: List[str],
-    temps: List[Optional[float]],
-    by_date: Dict[str, Dict[str, Optional[float]]],
-) -> None:
-    if not axis or not temps or len(axis) != len(temps):
-        return
-
-    per: Dict[str, List[float]] = {}
-    for t, v in zip(axis, temps):
-        if v is None:
-            continue
-        d = t[:10]
-        if d in target_dates:
-            per.setdefault(d, []).append(float(v))
-
-    for d in target_dates:
-        rec = by_date.setdefault(d, {"high_f": None, "low_f": None})
-        vals = per.get(d) or []
-        if not vals:
-            continue
-        if rec.get("high_f") is None:
-            rec["high_f"] = max(vals)
-        if rec.get("low_f") is None:
-            rec["low_f"] = min(vals)
-
-
 def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     STRICT payload shape (consumed by morning.py):
@@ -249,7 +218,7 @@ def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
     hourly_out: Dict[str, Any] = {"time": axis}
     for var in _HOURLY_VARS:
         m = var_maps.get(var) or {}
-        hourly_out[var] = _reindex_axis(axis, m)
+        hourly_out[var] = reindex_axis(axis, m)
 
     # ---- Daily (from API; align to target_dates; fallback from hourly temps if needed) ----
     daily = data.get("daily") or {}
@@ -277,7 +246,7 @@ def fetch_ome_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
     if any(
         (daily_by_date[d].get("high_f") is None or daily_by_date[d].get("low_f") is None) for d in target_dates
     ):
-        _backfill_daily_from_hourly_temps(
+        backfill_daily_from_hourly_temps(
             target_dates,
             axis,
             hourly_out.get("temperature_2m") or [],

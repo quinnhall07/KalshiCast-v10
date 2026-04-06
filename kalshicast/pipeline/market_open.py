@@ -15,49 +15,22 @@ import sys
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
-from kalshicast.config.params_bootstrap import get_param_int, get_param_float, load_db_overrides, get_param_bool
-from kalshicast.db.connection import init_db, get_conn, close_pool
-from kalshicast.db.schema import ensure_schema, seed_config_tables
+from kalshicast.config.params_bootstrap import get_param_int, get_param_float, get_param_bool
+from kalshicast.db.connection import get_conn, close_pool
 from kalshicast.db.operations import (
-    new_run_id, insert_pipeline_run, update_pipeline_run,
-    load_all_params, upsert_best_bets, insert_orderbook_snapshot,
-    insert_ibe_signal_log, get_previous_shadow_book,
+    update_pipeline_run, upsert_best_bets, insert_orderbook_snapshot,
+    insert_ibe_signal_log, get_previous_shadow_book, insert_system_alert,
 )
+from kalshicast.pipeline import pipeline_init, RUN_MARKET_OPEN, STATUS_OK, STATUS_PARTIAL, STATUS_ERROR
 
 log = logging.getLogger(__name__)
 
 
 def main() -> None:
     """Market-open pipeline — paper or live mode."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
-
-    # Parse --live flag
     live_mode = "--live" in sys.argv
 
-    # Step 1: init_db + PIPELINE_RUNS
-    init_db()
-    conn = get_conn()
-    try:
-        ensure_schema(conn)
-        seed_config_tables(conn)
-    finally:
-        conn.close()
-
-    pipeline_run_id = new_run_id()
-    conn = get_conn()
-    try:
-        insert_pipeline_run(conn, pipeline_run_id, "market_open")
-        conn.commit()
-    finally:
-        conn.close()
-
-    # Step 2: load_params
-    conn = get_conn()
-    try:
-        db_params = load_all_params(conn)
-        load_db_overrides(db_params)
-    finally:
-        conn.close()
+    pipeline_run_id, _ = pipeline_init(RUN_MARKET_OPEN)
 
     # Target dates: today + next FORECAST_DAYS
     now_utc = datetime.now(timezone.utc)
@@ -69,7 +42,7 @@ def main() -> None:
     log.info("Market-open pipeline (%s MODE) run_id=%s, dates=%s",
              mode_str, pipeline_run_id[:8], target_dates)
 
-    status = "OK"
+    status = STATUS_OK
     error_msg = None
     total_ensemble = 0
     total_shadow = 0
@@ -89,7 +62,7 @@ def main() -> None:
             except Exception as e:
                 log.error("Step 3 ERROR: bankroll fetch failed: %s", e)
                 log.info("Step 3: falling back to paper bankroll=$%.2f", bankroll)
-                status = "PARTIAL"
+                status = STATUS_PARTIAL
         else:
             client = None
             log.info("Step 3: paper mode bankroll=$%.2f", bankroll)
@@ -132,7 +105,24 @@ def main() -> None:
                      total_ensemble, len(target_dates))
         except Exception as e:
             log.error("Step 6 ERROR: ensemble computation failed: %s", e)
-            status = "PARTIAL"
+            status = STATUS_PARTIAL
+            insert_system_alert(conn, {
+                "alert_type": "ENSEMBLE_COMPUTATION_FAILED",
+                "severity_score": 0.85,
+                "details": {"error": str(e)[:300], "pipeline_run_id": pipeline_run_id},
+            })
+            conn.commit()
+
+        if total_ensemble == 0:
+            insert_system_alert(conn, {
+                "alert_type": "ENSEMBLE_NO_DATA",
+                "severity_score": 0.8,
+                "details": {
+                    "error": "Ensemble computation produced zero states — no forecast data available.",
+                    "target_dates": target_dates,
+                },
+            })
+            conn.commit()
 
         # Step 7: price_shadow_book
         try:
@@ -144,7 +134,13 @@ def main() -> None:
                      total_shadow, len(target_dates))
         except Exception as e:
             log.error("Step 7 ERROR: shadow book pricing failed: %s", e)
-            status = "PARTIAL"
+            status = STATUS_PARTIAL
+            insert_system_alert(conn, {
+                "alert_type": "SHADOW_BOOK_PRICING_FAILED",
+                "severity_score": 0.8,
+                "details": {"error": str(e)[:300], "pipeline_run_id": pipeline_run_id},
+            })
+            conn.commit()
 
         # Step 7.5: create_paper_positions (paper mode only)
         # Converts IS_SELECTED_FOR_EXECUTION BEST_BETS → PAPER_OPEN POSITIONS
@@ -162,10 +158,20 @@ def main() -> None:
                     conn, pipeline_run_id,
                     bankroll=1000.0,        # paper bankroll
                     target_dates=target_dates,
+                    paper_mode=True,
                 )
                 from kalshicast.pipeline.paper_sim import create_paper_positions
                 n_paper = create_paper_positions(conn, pipeline_run_id)
                 log.info("Step 7.5 OK: %d paper positions created", n_paper)
+                if n_paper == 0:
+                    insert_system_alert(conn, {
+                        "alert_type": "PAPER_NO_POSITIONS",
+                        "severity_score": 0.4,
+                        "details": {
+                            "pipeline_run_id": pipeline_run_id,
+                            "best_bets_count": len(best_bets_paper),
+                        },
+                    })
             except Exception as e:
                 log.warning("Step 7.5 WARN: paper position creation failed: %s", e)
 
@@ -192,7 +198,7 @@ def main() -> None:
                     log.info("Step 8 OK: %d orderbook snapshots", total_bets)
                 except Exception as e:
                     log.error("Step 8 ERROR: market price fetch failed: %s", e)
-                    status = "PARTIAL"
+                    status = STATUS_PARTIAL
 
                 # Step 9: evaluate_gates_and_ibe
                 try:
@@ -203,7 +209,7 @@ def main() -> None:
                 except Exception as e:
                     log.error("Step 9 ERROR: gate/IBE evaluation failed: %s", e)
                     best_bets = []
-                    status = "PARTIAL"
+                    status = STATUS_PARTIAL
 
                 # Step 10: submit_orders
                 try:
@@ -213,9 +219,27 @@ def main() -> None:
                     log.info("Step 10 OK: %d orders submitted, %d filled, %d skipped, %d errors",
                              summary.get("submitted", 0), summary.get("filled", 0),
                              summary.get("skipped", 0), summary.get("errors", 0))
+                    if summary.get("errors", 0) > 0:
+                        insert_system_alert(conn, {
+                            "alert_type": "ORDER_SUBMISSION_ERRORS",
+                            "severity_score": 0.7,
+                            "details": {
+                                "submitted": summary.get("submitted", 0),
+                                "filled": summary.get("filled", 0),
+                                "errors": summary.get("errors", 0),
+                                "skipped": summary.get("skipped", 0),
+                            },
+                        })
+                        conn.commit()
                 except Exception as e:
                     log.error("Step 10 ERROR: order submission failed: %s", e)
-                    status = "PARTIAL"
+                    status = STATUS_PARTIAL
+                    insert_system_alert(conn, {
+                        "alert_type": "ORDER_SUBMISSION_CRASHED",
+                        "severity_score": 0.9,
+                        "details": {"error": str(e)[:300], "pipeline_run_id": pipeline_run_id},
+                    })
+                    conn.commit()
         else:
             log.info("Steps 8-10: SKIPPED (%s mode — no market fetch, gates, or orders)", mode_str)
 
@@ -225,6 +249,20 @@ def main() -> None:
             log.info("Step 11 OK: pipeline_day_health updated")
         except Exception as e:
             log.warning("Step 11 WARN: health update failed: %s", e)
+
+        # Catch-all alert for non-OK runs
+        if status != STATUS_OK:
+            insert_system_alert(conn, {
+                "alert_type": f"PIPELINE_MARKET_OPEN_{status}",
+                "severity_score": 0.8 if status == STATUS_ERROR else 0.6,
+                "details": {
+                    "pipeline_run_id": pipeline_run_id,
+                    "status": status,
+                    "mode": mode_str,
+                    "shadow_rows": total_shadow,
+                    "bets_placed": total_bets,
+                },
+            })
 
         # Step 12: update_pipeline_run
         update_pipeline_run(
@@ -236,9 +274,14 @@ def main() -> None:
 
     except Exception as e:
         log.exception("Market-open pipeline failed: %s", e)
-        status = "ERROR"
+        status = STATUS_ERROR
         error_msg = str(e)[:2000]
         try:
+            insert_system_alert(conn, {
+                "alert_type": "PIPELINE_MARKET_OPEN_CRASH",
+                "severity_score": 0.95,
+                "details": {"error": str(e)[:500], "mode": mode_str},
+            })
             update_pipeline_run(conn, pipeline_run_id, status=status,
                                 error_msg=error_msg)
             conn.commit()
@@ -294,6 +337,7 @@ def _step9_evaluate_gates_ibe(
     pipeline_run_id: str,
     bankroll: float,
     target_dates: list[str],
+    paper_mode: bool = False,
 ) -> list[dict]:
     """Evaluate conviction gates, IBE signals, Kelly sizing for all candidates."""
     from kalshicast.execution.gates import evaluate_all_gates
@@ -302,22 +346,34 @@ def _step9_evaluate_gates_ibe(
     from kalshicast.execution.positions import get_remaining_capacity
 
     # Get Shadow Book candidates with market prices
+    # In paper mode, use P_WIN as synthetic market price (no orderbook data available)
     with conn.cursor() as cur:
-        cur.execute("""
-            SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
-                   sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
-                   sb.TOP_MODEL_ID,
-                   mos.C_VWAP_COMPUTED, mos.AVAILABLE_DEPTH
-            FROM SHADOW_BOOK sb
-            LEFT JOIN (
-                SELECT TICKER, C_VWAP_COMPUTED, AVAILABLE_DEPTH,
-                       ROW_NUMBER() OVER (PARTITION BY TICKER ORDER BY SNAPSHOT_UTC DESC) rn
-                FROM MARKET_ORDERBOOK_SNAPSHOTS
-            ) mos ON mos.TICKER = sb.TICKER AND mos.rn = 1
-            WHERE sb.PIPELINE_RUN_ID = :run_id
-              AND sb.P_WIN IS NOT NULL
-              AND mos.C_VWAP_COMPUTED IS NOT NULL
-        """, {"run_id": pipeline_run_id})
+        if paper_mode:
+            cur.execute("""
+                SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
+                       sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
+                       sb.TOP_MODEL_ID,
+                       sb.P_WIN AS C_VWAP_COMPUTED, 100 AS AVAILABLE_DEPTH
+                FROM SHADOW_BOOK sb
+                WHERE sb.PIPELINE_RUN_ID = :run_id
+                  AND sb.P_WIN IS NOT NULL
+            """, {"run_id": pipeline_run_id})
+        else:
+            cur.execute("""
+                SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
+                       sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
+                       sb.TOP_MODEL_ID,
+                       mos.C_VWAP_COMPUTED, mos.AVAILABLE_DEPTH
+                FROM SHADOW_BOOK sb
+                LEFT JOIN (
+                    SELECT TICKER, C_VWAP_COMPUTED, AVAILABLE_DEPTH,
+                           ROW_NUMBER() OVER (PARTITION BY TICKER ORDER BY SNAPSHOT_UTC DESC) rn
+                    FROM MARKET_ORDERBOOK_SNAPSHOTS
+                ) mos ON mos.TICKER = sb.TICKER AND mos.rn = 1
+                WHERE sb.PIPELINE_RUN_ID = :run_id
+                  AND sb.P_WIN IS NOT NULL
+                  AND mos.C_VWAP_COMPUTED IS NOT NULL
+            """, {"run_id": pipeline_run_id})
 
         candidates = []
         for row in cur:

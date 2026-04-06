@@ -25,8 +25,16 @@ def main():
 
     print(f"Logging failure and cleaning ghost runs for {workflow_name}...")
 
-    init_db()
-    conn = get_conn()
+    try:
+        init_db()
+        conn = get_conn()
+    except Exception as e:
+        # DB is unreachable — use GitHub Actions annotations as fallback
+        print(f"::error::CRITICAL: DB unreachable — cannot log alert for '{workflow_name}' failure. Error: {e}")
+        if run_url:
+            print(f"::error::Failed run URL: {run_url}")
+        sys.exit(1)
+ 
     try:
         with conn.cursor() as cur:
             # 1. Log the Alert
@@ -43,16 +51,17 @@ def main():
             # 2. Fix stuck "RUNNING" ghost runs
             # This closes out the run that was forcefully killed by GitHub
             cur.execute("""
-                UPDATE pipeline_runs 
-                SET status = 'ERROR', 
-                    error_msg = 'Process forcefully terminated by GitHub Action timeout/cancellation.'
-                WHERE pipeline_type = :wf AND status = 'RUNNING'
+                UPDATE PIPELINE_RUNS
+                SET STATUS = 'ERROR',
+                    COMPLETED_UTC = SYSTIMESTAMP,
+                    ERROR_MSG = 'Process forcefully terminated by GitHub Action timeout/cancellation.'
+                WHERE RUN_TYPE = :wf AND STATUS = 'RUNNING'
             """, {"wf": workflow_name})
             
         conn.commit()
         print(f"Successfully logged alert {alert_id} and closed orphaned runs.")
     except Exception as e:
-        print(f"CRITICAL: Failed to log to DB: {e}")
+        print(f"::error::CRITICAL: Failed to log workflow failure to DB: {e}")
     finally:
         conn.close()
         close_pool()

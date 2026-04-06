@@ -11,57 +11,31 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any
 
-from kalshicast.config.params_bootstrap import get_param_int, load_db_overrides
-from kalshicast.db.connection import init_db, get_conn, close_pool
-from kalshicast.db.schema import ensure_schema, seed_config_tables
-from kalshicast.db.operations import (
-    new_run_id, insert_pipeline_run, update_pipeline_run,
-    load_all_params,
-)
+from kalshicast.config.params_bootstrap import get_param_int
+from kalshicast.db.connection import get_conn, close_pool
+from kalshicast.db.operations import update_pipeline_run, insert_system_alert
+from kalshicast.pipeline import pipeline_init, RUN_NIGHT, STATUS_OK, STATUS_ERROR
 
 log = logging.getLogger(__name__)
 
 
 def main() -> None:
     """Night pipeline — 13-step execution sequence."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
-
-    # Step 1: init_db + PIPELINE_RUNS
-    init_db()
-    conn = get_conn()
-    try:
-        ensure_schema(conn)
-        seed_config_tables(conn)
-    finally:
-        conn.close()
-
-    pipeline_run_id = new_run_id()
-    conn = get_conn()
-    try:
-        insert_pipeline_run(conn, pipeline_run_id, "night")
-        conn.commit()
-    finally:
-        conn.close()
-
-    # Step 2: load_params
-    conn = get_conn()
-    try:
-        db_params = load_all_params(conn)
-        load_db_overrides(db_params)
-    finally:
-        conn.close()
+    pipeline_run_id, _ = pipeline_init(RUN_NIGHT)
 
     # Target date: yesterday in US Eastern Time
     now_est = datetime.now(ZoneInfo("America/New_York"))
     target_date = (now_est.date() - timedelta(days=1)).isoformat()
     log.info("Night pipeline for target_date=%s (run_id=%s)", target_date, pipeline_run_id[:8])
 
-    status = "OK"
+    status = STATUS_OK
     error_msg = None
     steps_ok = 0
 
     conn = get_conn()
     try:
+        steps_failed = []
+
         # Step 3: fetch_cli_observations
         try:
             from kalshicast.collection.collectors.collect_cli import fetch_observations
@@ -73,12 +47,13 @@ def main() -> None:
             log.info("Step 3 OK: observations fetched")
         except Exception as e:
             log.warning("Step 3 WARN: observation fetch failed: %s", e)
+            steps_failed.append(("OBSERVATION_FETCH", str(e)))
 
         # Step 3b: settle paper positions now that observations are available
-         try:
-             from kalshicast.pipeline.paper_sim import settle_paper_positions
-             n_paper_settled = settle_paper_positions(conn)
-             log.info("Step 3b OK: %d paper positions settled", n_paper_settled)
+        try:
+            from kalshicast.pipeline.paper_sim import settle_paper_positions
+            n_paper_settled = settle_paper_positions(conn)
+            log.info("Step 3b OK: %d paper positions settled", n_paper_settled)
         except Exception as e:
             log.warning("Step 3b WARN: paper settlement failed: %s", e)
 
@@ -100,6 +75,7 @@ def main() -> None:
             log.info("Step 5 OK: %d forecast errors", n_errors)
         except Exception as e:
             log.error("Step 5 ERROR: forecast errors failed: %s", e)
+            steps_failed.append(("FORECAST_ERROR_BUILD", str(e)))
 
         # Step 6: update_kalman_filters
         try:
@@ -109,6 +85,7 @@ def main() -> None:
             log.info("Step 6 OK: %d Kalman filters updated", n_kalman)
         except Exception as e:
             log.error("Step 6 ERROR: Kalman update failed: %s", e)
+            steps_failed.append(("KALMAN_UPDATE", str(e)))
 
         # Step 7: retroactive_kalman_correction
         try:
@@ -129,16 +106,18 @@ def main() -> None:
             log.info("Step 8 OK: dashboard stats refreshed")
         except Exception as e:
             log.error("Step 8 ERROR: dashboard stats failed: %s", e)
+            steps_failed.append(("DASHBOARD_STATS", str(e)))
 
         # Step 9: grade_brier_scores
         try:
             from kalshicast.evaluation.brier import grade_brier_scores
             n_graded = grade_brier_scores(conn, target_date)
-            conn.commit()  # <--- Add this missing commit
+            conn.commit()
             steps_ok += 1
             log.info("Step 9 OK: %d Brier scores graded", n_graded)
         except Exception as e:
             log.warning("Step 9 WARN: Brier grading failed: %s", e)
+            steps_failed.append(("BRIER_GRADING", str(e)))
 
         # Step 10: refresh_bss_matrix
         try:
@@ -148,6 +127,7 @@ def main() -> None:
             log.info("Step 10 OK: %d BSS cells refreshed", n_cells)
         except Exception as e:
             log.warning("Step 10 WARN: BSS matrix refresh failed: %s", e)
+            steps_failed.append(("BSS_REFRESH", str(e)))
 
         # Step 11: compute_financial_metrics
         try:
@@ -157,6 +137,7 @@ def main() -> None:
             log.info("Step 11 OK: financial metrics computed")
         except Exception as e:
             log.warning("Step 11 WARN: financial metrics failed: %s", e)
+            steps_failed.append(("FINANCIAL_METRICS", str(e)))
 
         # Step 12: run_pattern_classifier
         try:
@@ -172,6 +153,49 @@ def main() -> None:
         except Exception as e:
             log.warning("Step 12 WARN: pattern classifier failed: %s", e)
 
+        # Generate alerts for step failures
+        if steps_failed:
+            # Individual critical step alerts (Kalman, forecast errors)
+            critical_steps = {"KALMAN_UPDATE", "FORECAST_ERROR_BUILD", "OBSERVATION_FETCH"}
+            for step_name, step_err in steps_failed:
+                if step_name in critical_steps:
+                    insert_system_alert(conn, {
+                        "alert_type": f"NIGHT_{step_name}_FAILED",
+                        "severity_score": 0.8,
+                        "details": {
+                            "step": step_name,
+                            "error": step_err[:300],
+                            "target_date": target_date,
+                            "pipeline_run_id": pipeline_run_id,
+                        },
+                    })
+
+            # Summary alert if many steps failed
+            if len(steps_failed) >= 3:
+                status = STATUS_ERROR
+                insert_system_alert(conn, {
+                    "alert_type": "NIGHT_PIPELINE_DEGRADED",
+                    "severity_score": 0.85,
+                    "details": {
+                        "steps_ok": steps_ok,
+                        "steps_failed": len(steps_failed),
+                        "failed_steps": [s[0] for s in steps_failed],
+                        "target_date": target_date,
+                    },
+                })
+
+        # Catch-all alert for non-OK runs
+        if status != STATUS_OK:
+            insert_system_alert(conn, {
+                "alert_type": f"PIPELINE_NIGHT_{status}",
+                "severity_score": 0.8 if status == STATUS_ERROR else 0.6,
+                "details": {
+                    "pipeline_run_id": pipeline_run_id,
+                    "status": status,
+                    "steps_ok": steps_ok,
+                },
+            })
+
         # Step 13: update_pipeline_run
         update_pipeline_run(
             conn, pipeline_run_id,
@@ -182,9 +206,14 @@ def main() -> None:
 
     except Exception as e:
         log.exception("Night pipeline failed: %s", e)
-        status = "ERROR"
+        status = STATUS_ERROR
         error_msg = str(e)[:2000]
         try:
+            insert_system_alert(conn, {
+                "alert_type": "PIPELINE_NIGHT_CRASH",
+                "severity_score": 0.95,
+                "details": {"error": str(e)[:500], "target_date": target_date},
+            })
             update_pipeline_run(conn, pipeline_run_id, status=status,
                                 error_msg=error_msg)
             conn.commit()

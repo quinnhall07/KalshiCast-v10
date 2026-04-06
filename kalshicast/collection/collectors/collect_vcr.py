@@ -9,6 +9,7 @@ import requests
 
 from kalshicast.config import HEADERS
 from kalshicast.config.params_bootstrap import get_param_int, get_param_float
+from kalshicast.collection.collectors.base import to_float, backfill_daily_from_hourly_temps
 from kalshicast.collection.time_axis import (
     axis_start_end,
     build_hourly_axis_z,
@@ -55,16 +56,6 @@ def _get_key() -> str:
     return key
 
 
-def _to_float(x: Any) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        v = float(x)
-        return v
-    except Exception:
-        return None
-
-
 def _epoch_to_time_z_hour(epoch: Any) -> Optional[str]:
     """
     Visual Crossing hours include datetimeEpoch (seconds since epoch).
@@ -78,36 +69,6 @@ def _epoch_to_time_z_hour(epoch: Any) -> Optional[str]:
         return dt.isoformat().replace("+00:00", "Z")
     except Exception:
         return None
-
-
-def _backfill_daily_from_hourly_temps(
-    target_dates: List[str],
-    axis: List[str],
-    temps: List[Optional[float]],
-    daily_by_date: Dict[str, Dict[str, Optional[float]]],
-) -> None:
-    if not axis or not temps or len(axis) != len(temps):
-        return
-
-    per: Dict[str, List[float]] = {}
-    for t, v in zip(axis, temps):
-        if v is None:
-            continue
-        d = t[:10]
-        if d in target_dates:
-            per.setdefault(d, []).append(float(v))
-
-    for d in target_dates:
-        rec = daily_by_date.setdefault(d, {"high_f": None, "low_f": None})
-        if rec.get("high_f") is not None and rec.get("low_f") is not None:
-            continue
-        vals = per.get(d) or []
-        if not vals:
-            continue
-        if rec.get("high_f") is None:
-            rec["high_f"] = max(vals)
-        if rec.get("low_f") is None:
-            rec["low_f"] = min(vals)
 
 
 def fetch_vcr_forecast(station: dict, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -183,8 +144,8 @@ def fetch_vcr_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
 
             d = str(drec.get("datetime") or "")[:10]
             if d and d in daily_by_date:
-                hi = _to_float(drec.get("tempmax"))
-                lo = _to_float(drec.get("tempmin"))
+                hi = to_float(drec.get("tempmax"))
+                lo = to_float(drec.get("tempmin"))
                 if hi is not None:
                     daily_by_date[d]["high_f"] = float(hi)
                 if lo is not None:
@@ -206,13 +167,13 @@ def fetch_vcr_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
                     continue
 
                 # Fill maps (last write wins)
-                tv = _to_float(h.get("temp"))
-                dv = _to_float(h.get("dew"))
-                hv = _to_float(h.get("humidity"))
-                wsv = _to_float(h.get("windspeed"))
-                wdv = _to_float(h.get("winddir"))
-                ccv = _to_float(h.get("cloudcover"))
-                ppv = _to_float(h.get("precipprob"))
+                tv = to_float(h.get("temp"))
+                dv = to_float(h.get("dew"))
+                hv = to_float(h.get("humidity"))
+                wsv = to_float(h.get("windspeed"))
+                wdv = to_float(h.get("winddir"))
+                ccv = to_float(h.get("cloudcover"))
+                ppv = to_float(h.get("precipprob"))
 
                 if tv is not None:
                     temp_map[t] = float(tv)
@@ -245,7 +206,7 @@ def fetch_vcr_forecast(station: dict, params: Dict[str, Any] | None = None) -> D
     if any(
         (daily_by_date[d].get("high_f") is None or daily_by_date[d].get("low_f") is None) for d in target_dates
     ):
-        _backfill_daily_from_hourly_temps(target_dates, axis, hourly_out["temperature_f"], daily_by_date)
+        backfill_daily_from_hourly_temps(target_dates, axis, hourly_out["temperature_f"], daily_by_date)
 
     daily: List[Dict[str, Any]] = []
     for d in target_dates:

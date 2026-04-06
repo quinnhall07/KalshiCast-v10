@@ -10,7 +10,6 @@ import logging
 from typing import Any
 
 from kalshicast.config.params_bootstrap import get_param_int
-from kalshicast.db.operations import insert_system_alert
 
 log = logging.getLogger(__name__)
 
@@ -55,45 +54,3 @@ def compute_fill_quality_delta(conn: Any, window_days: int | None = None) -> dic
     }
 
 
-def check_adverse_selection(conn: Any) -> dict:
-    """Run adverse selection test.
-
-    WARNING if delta < -0.02, CRITICAL if delta < -0.05.
-    """
-    result = compute_fill_quality_delta(conn)
-
-    min_samples = 20
-    total_n = result["maker_n"] + result["taker_n"]
-
-    if total_n < min_samples:
-        result["status"] = "INSUFFICIENT_DATA"
-        log.info("[adverse_selection] insufficient data (%d/%d samples)", total_n, min_samples)
-        return result
-
-    delta = result["delta"]
-
-    if delta < -0.05:
-        result["status"] = "CRITICAL"
-        insert_system_alert(conn, {
-            "alert_type": "ADVERSE_SELECTION_CRITICAL",
-            "severity_score": 0.9,
-            "details": result,
-        })
-        conn.commit()
-        log.warning("[adverse_selection] CRITICAL: maker fill delta=%.4f", delta)
-
-    elif delta < -0.02:
-        result["status"] = "WARNING"
-        insert_system_alert(conn, {
-            "alert_type": "ADVERSE_SELECTION_WARNING",
-            "severity_score": 0.6,
-            "details": result,
-        })
-        conn.commit()
-        log.warning("[adverse_selection] WARNING: maker fill delta=%.4f", delta)
-
-    else:
-        result["status"] = "OK"
-        log.info("[adverse_selection] OK: maker fill delta=%.4f", delta)
-
-    return result

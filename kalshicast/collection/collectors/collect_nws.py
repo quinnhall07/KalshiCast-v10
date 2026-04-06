@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import requests
 
 from kalshicast.config import HEADERS
+from kalshicast.collection.collectors.base import reindex_axis
 from kalshicast.collection.time_axis import (
     axis_start_end,
     build_hourly_axis_z,
@@ -201,8 +202,6 @@ def _series(props: dict, name: str) -> Tuple[str, List[dict]]:
     return uom, vals if isinstance(vals, list) else []
 
 
-def _reindex_axis(axis: List[str], m: Dict[str, float]) -> List[Optional[float]]:
-    return [float(m[t]) if t in m else None for t in axis]
 
 
 # -------------------------
@@ -392,13 +391,13 @@ def fetch_nws_forecast(station: dict, params: Optional[Dict[str, Any]] = None) -
 
     hourly = {
         "time": axis,  # always 96
-        "temperature_f": _reindex_axis(axis, temp_map),
-        "dewpoint_f": _reindex_axis(axis, dew_map),
-        "humidity_pct": _reindex_axis(axis, rh_map),
-        "wind_speed_mph": _reindex_axis(axis, ws_map),
-        "wind_dir_deg": _reindex_axis(axis, wd_map),
-        "cloud_cover_pct": _reindex_axis(axis, sc_map),
-        "precip_prob_pct": _reindex_axis(axis, pop_map),
+        "temperature_f": reindex_axis(axis, temp_map),
+        "dewpoint_f": reindex_axis(axis, dew_map),
+        "humidity_pct": reindex_axis(axis, rh_map),
+        "wind_speed_mph": reindex_axis(axis, ws_map),
+        "wind_dir_deg": reindex_axis(axis, wd_map),
+        "cloud_cover_pct": reindex_axis(axis, sc_map),
+        "precip_prob_pct": reindex_axis(axis, pop_map),
     }
 
     # --- Daily from /forecast, fallback from hourly temperature if incomplete ---

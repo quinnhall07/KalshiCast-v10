@@ -7,11 +7,8 @@ Evaluates acceptance criteria: BSS, Brier, PnL.
 from __future__ import annotations
 
 import logging
-import math
 from datetime import date, timedelta
 from typing import Any
-
-from kalshicast.config.params_bootstrap import get_param_int, get_param_float
 
 log = logging.getLogger(__name__)
 
