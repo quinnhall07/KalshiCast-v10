@@ -167,7 +167,7 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
     # Fetch all Kalman states at once instead of querying per-station inside the loop
     kalman_cache: dict[str, float] = {}
     with conn.cursor() as cur:
-        cur.execute("SELECT STATION_ID, TARGET_TYPE, B_K FROM KALMAN_STATE")
+        cur.execute("SELECT STATION_ID, TARGET_TYPE, B_K FROM KALMAN_STATES")
         for row in cur:
             key = f"{row[0]}|{row[1]}"
             kalman_cache[key] = float(row[2]) if row[2] is not None else 0.0
