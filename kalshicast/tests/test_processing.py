@@ -1,11 +1,13 @@
 """L2 Processing unit tests."""
 
 import pytest
+from unittest.mock import patch, MagicMock
 from kalshicast.processing.kalman import (
     KalmanState, init_kalman_state, compute_R_k, compute_Q_k,
     kalman_update, _compute_ewm_variance,
 )
 from kalshicast.processing.regime import detect_bimodal, _iqr, _kmeans_2
+from kalshicast.processing.ensemble import _compute_per_source_skill
 
 
 class TestKalmanState:
@@ -126,3 +128,80 @@ class TestKMeans2:
     def test_single_value(self):
         c1, c2, s1, s2 = _kmeans_2([5.0])
         assert c1 == 5.0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Per-source skill scoring tests
+# ─────────────────────────────────────────────────────────────────────
+
+def _make_errors(values: list[float]) -> list[dict]:
+    """Build a list of error-row dicts suitable for mocking DB results."""
+    return [{"error_adjusted": None, "error_raw": v} for v in values]
+
+
+class TestPerSourceSkill:
+    """Tests for _compute_per_source_skill."""
+
+    def _call(self, side_effects, source_ids):
+        """Call _compute_per_source_skill with a mocked DB operation."""
+        with patch(
+            "kalshicast.db.operations.get_forecast_errors_window"
+        ) as mock_get:
+            mock_get.side_effect = side_effects
+            conn = MagicMock()
+            return _compute_per_source_skill(
+                conn, "KORD", "HIGH", "h2", source_ids, window=30
+            )
+
+    def test_cold_start_no_sources_have_data(self):
+        """Returns all-zero scores when no source meets min_samples."""
+        # Each source returns fewer than 5 samples
+        side_effects = [
+            _make_errors([1.0, 2.0]),  # src_a — only 2 samples
+            _make_errors([0.5]),        # src_b — only 1 sample
+        ]
+        scores = self._call(side_effects, ["src_a", "src_b"])
+        assert scores == [0.0, 0.0]
+
+    def test_single_source_with_history_gets_full_skill(self):
+        """When exactly one source meets min_samples, it gets skill 1.0."""
+        side_effects = [
+            _make_errors([1.0] * 10),  # src_a — 10 samples
+            _make_errors([]),          # src_b — 0 samples
+        ]
+        scores = self._call(side_effects, ["src_a", "src_b"])
+        assert scores[0] == 1.0
+        assert scores[1] == 0.0
+
+    def test_two_sources_scores_normalized_correctly(self):
+        """Best source gets skill > 0; worst source gets 0."""
+        # src_a has lower MSE (better), src_b higher MSE (worse)
+        side_effects = [
+            _make_errors([1.0] * 10),  # src_a: MSE = 1.0
+            _make_errors([3.0] * 10),  # src_b: MSE = 9.0
+        ]
+        scores = self._call(side_effects, ["src_a", "src_b"])
+        # src_a: 1 - (1/9) ≈ 0.888, src_b: 1 - (9/9) = 0.0
+        assert scores[1] == pytest.approx(0.0)
+        assert scores[0] > 0.0
+        assert all(s >= 0.0 for s in scores)
+
+    def test_equal_mse_produces_equal_scores(self):
+        """Two sources with identical MSE get the same skill score."""
+        side_effects = [
+            _make_errors([2.0] * 10),
+            _make_errors([2.0] * 10),
+        ]
+        scores = self._call(side_effects, ["src_a", "src_b"])
+        assert scores[0] == pytest.approx(scores[1])
+
+    def test_source_missing_from_history_scores_zero(self):
+        """A source with no history rows scores 0 even when others have data."""
+        side_effects = [
+            _make_errors([1.0] * 10),  # src_a
+            _make_errors([2.0] * 10),  # src_b
+            _make_errors([]),          # src_c — no history
+        ]
+        scores = self._call(side_effects, ["src_a", "src_b", "src_c"])
+        assert scores[2] == 0.0
+        assert scores[0] > 0.0 or scores[1] > 0.0

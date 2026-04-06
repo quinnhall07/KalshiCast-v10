@@ -193,6 +193,75 @@ def compute_sigma_eff(sigma_adj: float, s_weighted: float,
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Per-source skill scoring
+# ─────────────────────────────────────────────────────────────────────
+
+def _compute_per_source_skill(conn: Any, station_id: str, target_type: str,
+                               lead_bracket: str, source_ids: list[str],
+                               window: int) -> list[float]:
+    """Compute per-source skill scores from FORECAST_ERRORS.
+
+    For each source, compute MSE from recent forecast errors.
+    Convert to BSS-like skill: skill = max(0, 1 - MSE_src / MSE_worst).
+
+    Returns list aligned with source_ids. Falls back to zeros
+    (→ uniform weights via compute_weights) during cold start.
+    """
+    from kalshicast.db.operations import get_forecast_errors_window
+
+    min_samples = 5
+    source_mse: dict[str, float] = {}
+
+    for src in source_ids:
+        errors = get_forecast_errors_window(
+            conn, station_id, src, target_type, lead_bracket, window
+        )
+        sq_errors = []
+        for e in errors:
+            val = (e.get("error_adjusted")
+                   if e.get("error_adjusted") is not None
+                   else e.get("error_raw"))
+            if val is not None:
+                sq_errors.append(float(val) ** 2)
+
+        if len(sq_errors) >= min_samples:
+            source_mse[src] = sum(sq_errors) / len(sq_errors)
+
+    # Need at least 2 sources with data to differentiate
+    if len(source_mse) < 2:
+        # With exactly one source we know its performance — give it full skill
+        if len(source_mse) == 1:
+            only_src = next(iter(source_mse))
+            return [1.0 if src == only_src else 0.0 for src in source_ids]
+        return [0.0] * len(source_ids)
+
+    mse_baseline = max(source_mse.values())
+    if mse_baseline <= 0:
+        return [0.0] * len(source_ids)
+
+    return [
+        max(0.0, 1.0 - source_mse[src] / mse_baseline)
+        if src in source_mse else 0.0
+        for src in source_ids
+    ]
+
+
+def _select_top_from_skill(skill_scores: list[float], source_ids: list[str],
+                            source_forecasts: dict[str, float]) -> str | None:
+    """Pick the source with highest skill score.
+
+    Returns None if all scores are zero (cold start), letting the
+    caller fall back to BSS_MATRIX or KALMAN_STATES.
+    """
+    if not skill_scores or max(skill_scores) <= 0:
+        return None
+
+    best_idx = max(range(len(skill_scores)), key=lambda i: skill_scores[i])
+    src = source_ids[best_idx]
+    return src if src in source_forecasts else None
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Master ensemble computation
 # ─────────────────────────────────────────────────────────────────────
 
@@ -241,6 +310,7 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
     ensemble_rows = []
     weight_rows = []
     count = 0
+    global_rmse_cache: dict[tuple[str, str], float] = {}
 
     for st in stations:
         station_id = st["station_id"]
@@ -275,15 +345,23 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
             # Pre-fetch Kalman state (used by both top model selection and bias correction)
             ks = get_kalman_state(conn, station_id, target_type)
 
-            # Top model selection (cold start → first source or lowest error)
-            top_model = select_top_model(conn, station_id, lb, target_type, kalman_state=ks)
-            if top_model is None or top_model not in source_forecasts:
-                top_model = source_ids[0]  # fallback: first available
+            # Per-source skill from forecast error history (cold start → uniform)
+            bss_scores = _compute_per_source_skill(
+                conn, station_id, target_type, lb, source_ids, window
+            )
+
+            # Top model = highest skill source (consistent with weight derivation)
+            top_model = _select_top_from_skill(
+                bss_scores, source_ids, source_forecasts
+            )
+            if top_model is None:
+                # Cold start: fall back to BSS_MATRIX → KALMAN_STATES → first
+                top_model = select_top_model(conn, station_id, lb, target_type, kalman_state=ks)
+                if top_model is None or top_model not in source_forecasts:
+                    top_model = source_ids[0]
 
             f_top = source_forecasts[top_model]
 
-            # BSS weights (cold start → uniform)
-            bss_scores = [0.0] * m_k  # placeholder until BSS matrix populated
             weights = compute_weights(bss_scores, source_ids)
 
             # Staleness decay (all ages = 0 in paper mode since we just collected)
@@ -294,7 +372,10 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
             s_unweighted, s_weighted = compute_spread(fc_values, weights)
 
             # Sigma
-            sigma_adj = compute_sigma_for_pricing(conn, station_id, target_type, lb)
+            sigma_adj = compute_sigma_for_pricing(
+                conn, station_id, target_type, lb,
+                global_rmse_cache=global_rmse_cache,
+            )
 
             # Skewness from error history
             errors_for_skew = get_forecast_errors_window(
@@ -312,7 +393,7 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
 
             # Kalman-corrected μ
             b_k = ks["b_k"] if ks else 0.0
-            mu = f_top + b_k  # bias correction: μ = f_top + B_k
+            mu = f_top - b_k  # bias correction: μ = f_top - B_k (B_k tracks forecast-observed)
 
             # Build rows
             weight_json = {s: round(w, 6) for s, w in zip(source_ids, weights)}

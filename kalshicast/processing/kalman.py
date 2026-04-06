@@ -159,7 +159,7 @@ def update_kalman_filters(conn: Any, target_date: str, run_id: str) -> int:
 
     For each (station, target_type):
     1. Read current state from KALMAN_STATES
-    2. Get observation error (epsilon_k = observed - f_top)
+    2. Get observation error (epsilon_k = error_raw = forecast - observed)
     3. Get ensemble spread for R_k computation
     4. Run kalman_update
     5. Persist to KALMAN_STATES + KALMAN_HISTORY
