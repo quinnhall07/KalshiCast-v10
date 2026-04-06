@@ -178,7 +178,7 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
     error_cache = defaultdict(list)
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT STATION_ID, MODEL_ID, TARGET_TYPE, ERROR_ADJUSTED, ERROR_RAW
+            SELECT STATION_ID, SOURCE_ID, TARGET_TYPE, ERROR_ADJUSTED, ERROR_RAW
             FROM FORECAST_ERRORS
             WHERE LEAD_BRACKET = 'h2'
               AND TARGET_DATE >= CURRENT_DATE - :window
