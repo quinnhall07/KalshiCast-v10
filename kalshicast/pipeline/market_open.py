@@ -146,8 +146,9 @@ def main() -> None:
         # Step 8: fetch_market_prices (Required for accurate paper trades AND live trades)
         if client is not None:
             try:
-                total_bets = _step8_fetch_market_prices(conn, client, pipeline_run_id)
-                log.info("Step 8 OK: %d orderbook snapshots", total_bets)
+                # Rename the variable so it doesn't overwrite your actual bet count
+                total_snapshots = _step8_fetch_market_prices(conn, client, pipeline_run_id)
+                log.info("Step 8 OK: %d orderbook snapshots", total_snapshots)
             except Exception as e:
                 log.error("Step 8 ERROR: market price fetch failed: %s", e)
                 status = STATUS_PARTIAL
