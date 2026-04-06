@@ -168,7 +168,7 @@ def main() -> None:
                     conn, pipeline_run_id,
                     bankroll=1000.0,        # paper bankroll
                     target_dates=target_dates,
-                    paper_mode=True,
+                    paper_mode=False,
                 )
                 from kalshicast.pipeline.paper_sim import create_paper_positions
                 n_paper = create_paper_positions(conn, pipeline_run_id)
