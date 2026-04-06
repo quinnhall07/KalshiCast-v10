@@ -83,8 +83,9 @@ def check_skill_gate(bss: float | None, was_qualified: bool) -> dict:
     bss_exit = get_param_float("gate.bss_exit")
 
     if bss is None:
-        return {"gate": "skill", "pass": False, "bss": None, "reason": "no_bss"}
-
+        # Cold start bypass: Allow the system to place trades while building history
+        return {"gate": "skill", "pass": True, "bss": None, "reason": "no_bss_cold_start"}
+        
     if was_qualified:
         passed = bss >= bss_exit
     else:
