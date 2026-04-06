@@ -51,18 +51,20 @@ def main() -> None:
 
     conn = get_conn()
     try:
-        # Step 3: fetch_bankroll
+        # Step 3: fetch_bankroll and init client
         bankroll = 1000.0  # Paper mode default
-        if live_mode:
-            try:
-                from kalshicast.execution.kalshi_api import KalshiClient
-                client = KalshiClient()
+        client = None
+        try:
+            from kalshicast.execution.kalshi_api import KalshiClient
+            client = KalshiClient()
+            if live_mode:
                 bankroll = client.get_balance()
                 log.info("Step 3: live bankroll=$%.2f", bankroll)
-            except Exception as e:
-                log.error("Step 3 ERROR: bankroll fetch failed: %s", e)
-                log.info("Step 3: falling back to paper bankroll=$%.2f", bankroll)
-                status = STATUS_PARTIAL
+            else:
+                log.info("Step 3: paper mode bankroll=$%.2f (Connected to API for pricing)", bankroll)
+        except Exception as e:
+            log.error("Step 3 ERROR: API connection failed: %s", e)
+            status = STATUS_PARTIAL
         else:
             client = None
             log.info("Step 3: paper mode bankroll=$%.2f", bankroll)
@@ -141,6 +143,15 @@ def main() -> None:
                 "details": {"error": str(e)[:300], "pipeline_run_id": pipeline_run_id},
             })
             conn.commit()
+        
+        # Step 8: fetch_market_prices (Required for accurate paper trades AND live trades)
+        if client is not None:
+            try:
+                total_bets = _step8_fetch_market_prices(conn, client, pipeline_run_id)
+                log.info("Step 8 OK: %d orderbook snapshots", total_bets)
+            except Exception as e:
+                log.error("Step 8 ERROR: market price fetch failed: %s", e)
+                status = STATUS_PARTIAL
 
         # Step 7.5: create_paper_positions (paper mode only)
         # Converts IS_SELECTED_FOR_EXECUTION BEST_BETS → PAPER_OPEN POSITIONS
@@ -158,7 +169,7 @@ def main() -> None:
                     conn, pipeline_run_id,
                     bankroll=1000.0,        # paper bankroll
                     target_dates=target_dates,
-                    paper_mode=True,
+                    paper_mode=False,
                 )
                 from kalshicast.pipeline.paper_sim import create_paper_positions
                 n_paper = create_paper_positions(conn, pipeline_run_id)
@@ -192,14 +203,6 @@ def main() -> None:
                 log.warning("EXECUTION SKIPPED: System is OFFLINE. Reason: %s", offline_reason)
                 status = "OFFLINE"
             else:
-                # Step 8: fetch_market_prices
-                try:
-                    total_bets = _step8_fetch_market_prices(conn, client, pipeline_run_id)
-                    log.info("Step 8 OK: %d orderbook snapshots", total_bets)
-                except Exception as e:
-                    log.error("Step 8 ERROR: market price fetch failed: %s", e)
-                    status = STATUS_PARTIAL
-
                 # Step 9: evaluate_gates_and_ibe
                 try:
                     best_bets = _step9_evaluate_gates_ibe(
