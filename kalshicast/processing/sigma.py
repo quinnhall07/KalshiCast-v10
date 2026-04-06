@@ -23,7 +23,15 @@ def compute_per_model_rmse(errors: list[float]) -> float:
         return 0.0
     return math.sqrt(sum(e * e for e in errors) / len(errors))
 
-
+def compute_global_rmse(station_rmses: dict[str, float]) -> float:
+    """Compute the global RMSE prior across all stations.
+    
+    Averages the individual station RMSEs to use as the global baseline
+    for Bayesian shrinkage.
+    """
+    if not station_rmses:
+        return 0.0
+    return sum(station_rmses.values()) / len(station_rmses)
 
 def bayesian_shrinkage(station_rmse: float, global_rmse: float,
                        n: int, m_prior: int | None = None) -> float:
