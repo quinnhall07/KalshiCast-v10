@@ -25,8 +25,16 @@ def main():
 
     print(f"Logging failure and cleaning ghost runs for {workflow_name}...")
 
-    init_db()
-    conn = get_conn()
+    try:
+        init_db()
+        conn = get_conn()
+    except Exception as e:
+        # DB is unreachable — use GitHub Actions annotations as fallback
+        print(f"::error::CRITICAL: DB unreachable — cannot log alert for '{workflow_name}' failure. Error: {e}")
+        if run_url:
+            print(f"::error::Failed run URL: {run_url}")
+        sys.exit(1)
+ 
     try:
         with conn.cursor() as cur:
             # 1. Log the Alert
@@ -53,7 +61,7 @@ def main():
         conn.commit()
         print(f"Successfully logged alert {alert_id} and closed orphaned runs.")
     except Exception as e:
-        print(f"CRITICAL: Failed to log to DB: {e}")
+        print(f"::error::CRITICAL: Failed to log workflow failure to DB: {e}")
     finally:
         conn.close()
         close_pool()

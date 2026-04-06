@@ -8,11 +8,15 @@ Required env vars:
 
 from __future__ import annotations
 
+import logging
+import time
 import os
 from datetime import datetime, timezone
 from typing import Any
 
 import oracledb
+
+logger = logging.getLogger(__name__)
 
 _pool: oracledb.ConnectionPool | None = None
 
@@ -74,12 +78,26 @@ def _ensure_pool() -> oracledb.ConnectionPool:
     return _pool
 
 
-def get_conn() -> oracledb.Connection:
-    """Acquire a connection from the pool."""
-    pool = _ensure_pool()
-    conn = pool.acquire()
-    conn.autocommit = False
-    return conn
+def get_conn(*, retries: int = 3, backoff: float = 2.0) -> oracledb.Connection:
+    """Acquire a connection from the pool with retry on transient failures."""
+    for attempt in range(1, retries + 1):
+        try:
+            pool = _ensure_pool()
+            conn = pool.acquire()
+            conn.autocommit = False
+            return conn
+        except oracledb.Error as exc:
+            if attempt == retries:
+                raise
+            wait = backoff ** attempt
+            logger.warning(
+                "DB connection attempt %d/%d failed (%s), retrying in %.0fs…",
+                attempt, retries, exc, wait,
+            )
+            # Reset the pool so the next attempt creates a fresh one
+            close_pool()
+            time.sleep(wait)
+    raise RuntimeError("unreachable")  # satisfies type checker
 
 
 def close_pool() -> None:
