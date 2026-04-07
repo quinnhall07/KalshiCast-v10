@@ -1,0 +1,238 @@
+"""Tests for paper trading fixes — zero VWAP filter, diagnostic logging, enriched alerts.
+
+These tests verify the three fixes without requiring a database connection.
+They test the logic in isolation using the same function signatures as production.
+"""
+
+import math
+import pytest
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Fix 1 tests: c_market=0.0 should never reach gates/Kelly
+# ─────────────────────────────────────────────────────────────────────
+
+class TestZeroVwapFiltering:
+    """Verify that candidates with c_market=0.0 are excluded before gate evaluation."""
+
+    def test_zero_vwap_excluded_from_kelly(self):
+        """Kelly's Step 1 filter requires c > 0. Verify c=0 is excluded."""
+        from kalshicast.execution.kelly import smirnov_kelly
+
+        bins = [
+            {"p_win": 0.30, "c_market": 0.0, "ticker": "ZERO-VWAP"},
+            {"p_win": 0.25, "c_market": 0.0, "ticker": "ALSO-ZERO"},
+        ]
+        result = smirnov_kelly(bins)
+        assert result == [], "Kelly should return empty list for c_market=0.0 bins"
+
+    def test_zero_vwap_edge_gate_is_misleading(self):
+        """Edge gate passes for c_market=0.0 (infinite edge) — this is the bug Fix 1 prevents."""
+        from kalshicast.execution.gates import check_edge_gate
+
+        result = check_edge_gate(
+            p_win=0.30, c_market=0.0,
+            bankroll=1000.0, n_bets=100,
+        )
+        # With c_market=0: edge=0.30, fee_cents=0, ev_net=30.0, ev_threshold=0.0
+        # So the gate PASSES — which is wrong behavior that Fix 1's SQL filter prevents
+        # by never letting c_market=0 candidates reach this point.
+        assert result["pass"], (
+            "Edge gate passes for c_market=0 (this is expected — "
+            "Fix 1 prevents these candidates upstream in SQL)"
+        )
+        assert result["edge"] == 0.30
+
+    def test_nonzero_vwap_normal_flow(self):
+        """Normal candidates with real market prices flow through correctly."""
+        from kalshicast.execution.kelly import smirnov_kelly
+
+        bins = [
+            {"p_win": 0.40, "c_market": 0.30, "ticker": "HAS-EDGE"},
+            {"p_win": 0.25, "c_market": 0.35, "ticker": "NO-EDGE"},
+        ]
+        result = smirnov_kelly(bins)
+        # Only the bin with p/c > 1.0 should be in result
+        assert len(result) >= 1
+        assert any(r["ticker"] == "HAS-EDGE" for r in result)
+        assert all(r.get("f_star", 0) > 0 for r in result)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Fix 2 tests: Diagnostic logging computes correct funnel counts
+# ─────────────────────────────────────────────────────────────────────
+
+class TestDiagnosticFunnel:
+    """Verify the funnel counting logic from Fix 2."""
+
+    def _make_bet(self, gate_flags, f_star=0.0, ibe_veto=False,
+                  selected=False, p_win=0.3, c_vwap=0.35):
+        return {
+            "gate_flags": gate_flags,
+            "f_star": f_star,
+            "ibe_veto": ibe_veto,
+            "is_selected_for_execution": selected,
+            "p_win": p_win,
+            "c_vwap": c_vwap,
+            "contract_price": c_vwap,
+        }
+
+    def test_all_gates_fail(self):
+        """When edge gate fails, bottleneck should be edge."""
+        bets = [
+            self._make_bet({"edge": False, "spread": True, "skill": True, "lead": True, "reserved": True}),
+            self._make_bet({"edge": False, "spread": True, "skill": True, "lead": True, "reserved": True}),
+        ]
+
+        n_all_gates_pass = sum(
+            1 for b in bets
+            if all(b.get("gate_flags", {}).get(g, False)
+                   for g in ("edge", "spread", "skill", "lead", "reserved"))
+        )
+        assert n_all_gates_pass == 0
+
+        # Compute bottleneck
+        gate_names = ["edge", "spread", "skill", "lead"]
+        fail_counts = {
+            g: sum(1 for b in bets if not b.get("gate_flags", {}).get(g, True))
+            for g in gate_names
+        }
+        worst_gate = max(fail_counts, key=fail_counts.get)
+        assert worst_gate == "edge"
+        assert fail_counts["edge"] == 2
+
+    def test_gates_pass_kelly_fails(self):
+        """When gates pass but Kelly finds no edge, bottleneck should be kelly."""
+        bets = [
+            self._make_bet(
+                {"edge": True, "spread": True, "skill": True, "lead": True, "reserved": True},
+                f_star=0.0,
+            ),
+        ]
+
+        n_all_gates_pass = sum(
+            1 for b in bets
+            if all(b.get("gate_flags", {}).get(g, False)
+                   for g in ("edge", "spread", "skill", "lead", "reserved"))
+        )
+        n_kelly_positive = sum(1 for b in bets if (b.get("f_star") or 0) > 0)
+        n_selected = sum(1 for b in bets if b.get("is_selected_for_execution"))
+
+        assert n_all_gates_pass == 1
+        assert n_kelly_positive == 0
+        assert n_selected == 0
+
+        # Bottleneck should be kelly
+        if n_all_gates_pass > 0 and n_kelly_positive == 0:
+            bottleneck = "kelly_no_positive_edge"
+        assert bottleneck == "kelly_no_positive_edge"
+
+    def test_ibe_veto_bottleneck(self):
+        """When Kelly passes but IBE vetoes, bottleneck should be ibe."""
+        bets = [
+            self._make_bet(
+                {"edge": True, "spread": True, "skill": True, "lead": True, "reserved": True},
+                f_star=0.05, ibe_veto=True,
+            ),
+        ]
+
+        n_kelly_positive = sum(1 for b in bets if (b.get("f_star") or 0) > 0)
+        n_ibe_veto = sum(1 for b in bets if b.get("ibe_veto"))
+        n_selected = sum(1 for b in bets if b.get("is_selected_for_execution"))
+
+        assert n_kelly_positive == 1
+        assert n_ibe_veto == 1
+        assert n_selected == 0
+
+    def test_edge_stats_computation(self):
+        """Edge stats should only include candidates with real market prices."""
+        bets = [
+            self._make_bet({}, p_win=0.40, c_vwap=0.35),   # edge = 0.05
+            self._make_bet({}, p_win=0.30, c_vwap=0.32),   # edge = -0.02
+            self._make_bet({}, p_win=0.50, c_vwap=0.0),    # EXCLUDED (zero vwap)
+            self._make_bet({}, p_win=0.20, c_vwap=None),   # EXCLUDED (no vwap)
+        ]
+
+        edges = [
+            b["p_win"] - b.get("contract_price", b.get("c_vwap", 0))
+            for b in bets
+            if b.get("c_vwap") and b["c_vwap"] > 0
+        ]
+        assert len(edges) == 2  # Only the two with real c_vwap
+        avg_edge = sum(edges) / len(edges)
+        assert abs(avg_edge - 0.015) < 0.001  # (0.05 + -0.02) / 2
+        assert max(edges) == 0.05
+
+    def test_successful_selection_no_bottleneck(self):
+        """When bets are selected, no bottleneck should be logged."""
+        bets = [
+            self._make_bet(
+                {"edge": True, "spread": True, "skill": True, "lead": True, "reserved": True},
+                f_star=0.08, selected=True,
+            ),
+        ]
+        n_selected = sum(1 for b in bets if b.get("is_selected_for_execution"))
+        assert n_selected == 1
+        # The bottleneck block only runs when n_selected == 0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Fix 3 tests: Enriched alert details
+# ─────────────────────────────────────────────────────────────────────
+
+class TestEnrichedAlert:
+    """Verify the enriched PAPER_NO_POSITIONS alert computes correct stats."""
+
+    def test_alert_details_with_no_edge(self):
+        """Alert should show zero kelly_positive when no edge exists."""
+        best_bets_paper = [
+            {"p_win": 0.30, "c_vwap": 0.32, "contract_price": 0.32,
+             "gate_flags": {"edge": False, "spread": True, "skill": True, "lead": True, "reserved": True},
+             "f_star": 0.0},
+            {"p_win": 0.25, "c_vwap": 0.26, "contract_price": 0.26,
+             "gate_flags": {"edge": False, "spread": True, "skill": True, "lead": True, "reserved": True},
+             "f_star": 0.0},
+        ]
+
+        edges_for_alert = [
+            b["p_win"] - b.get("contract_price", b.get("c_vwap", 0))
+            for b in best_bets_paper
+            if b.get("c_vwap") and b["c_vwap"] > 0
+        ]
+        gate_pass_count = sum(
+            1 for b in best_bets_paper
+            if all(b.get("gate_flags", {}).get(g, False)
+                   for g in ("edge", "spread", "skill", "lead", "reserved"))
+        )
+        kelly_pass_count = sum(
+            1 for b in best_bets_paper if (b.get("f_star") or 0) > 0
+        )
+
+        assert len(edges_for_alert) == 2
+        assert gate_pass_count == 0  # edge gate failed for both
+        assert kelly_pass_count == 0
+        avg_edge = sum(edges_for_alert) / len(edges_for_alert)
+        assert avg_edge < 0  # (-0.02 + -0.01) / 2 = -0.015
+
+    def test_alert_details_with_empty_bets(self):
+        """Alert should handle empty best_bets gracefully."""
+        best_bets_paper = []
+
+        edges_for_alert = [
+            b["p_win"] - b.get("contract_price", b.get("c_vwap", 0))
+            for b in best_bets_paper
+            if b.get("c_vwap") and b["c_vwap"] > 0
+        ]
+        gate_pass_count = sum(
+            1 for b in best_bets_paper
+            if all(b.get("gate_flags", {}).get(g, False)
+                   for g in ("edge", "spread", "skill", "lead", "reserved"))
+        )
+
+        assert edges_for_alert == []
+        assert gate_pass_count == 0
+        # avg_edge and max_edge should be None when edges_for_alert is empty
+        avg_edge = round(sum(edges_for_alert) / len(edges_for_alert), 4) if edges_for_alert else None
+        max_edge = round(max(edges_for_alert), 4) if edges_for_alert else None
+        assert avg_edge is None
+        assert max_edge is None

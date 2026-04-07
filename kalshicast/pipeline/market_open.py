@@ -161,7 +161,7 @@ def main() -> None:
                 from kalshicast.execution.gates import evaluate_all_gates
                 from kalshicast.execution.kelly import smirnov_kelly, full_sizing_chain
                 from kalshicast.db.operations import upsert_best_bets
- 
+
                 # In paper mode we still need to populate BEST_BETS with
                 # IS_SELECTED_FOR_EXECUTION = 1 so paper_sim has rows to consume.
                 # Re-use the same gate/Kelly logic as live, but skip order submission.
@@ -174,15 +174,61 @@ def main() -> None:
                 from kalshicast.pipeline.paper_sim import create_paper_positions
                 n_paper = create_paper_positions(conn, pipeline_run_id)
                 log.info("Step 7.5 OK: %d paper positions created", n_paper)
+
+                # ── FIX 3: Enriched PAPER_NO_POSITIONS alert ─────────────
                 if n_paper == 0:
+                    # Compute edge stats for alert details
+                    edges_for_alert = [
+                        b["p_win"] - b.get("contract_price", b.get("c_vwap", 0))
+                        for b in best_bets_paper
+                        if b.get("c_vwap") and b["c_vwap"] > 0
+                    ]
+                    gate_pass_count = sum(
+                        1 for b in best_bets_paper
+                        if all(b.get("gate_flags", {}).get(g, False)
+                               for g in ("edge", "spread", "skill", "lead", "reserved"))
+                    )
+                    kelly_pass_count = sum(
+                        1 for b in best_bets_paper if (b.get("f_star") or 0) > 0
+                    )
+
+                    # Count orderbook snapshots with real depth
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT
+                                COUNT(*) AS total_snapshots,
+                                SUM(CASE WHEN C_VWAP_COMPUTED > 0
+                                     AND AVAILABLE_DEPTH > 0 THEN 1 ELSE 0 END) AS with_depth
+                            FROM MARKET_ORDERBOOK_SNAPSHOTS mos
+                            WHERE EXISTS (
+                                SELECT 1 FROM SHADOW_BOOK sb
+                                WHERE sb.TICKER = mos.TICKER
+                                  AND sb.PIPELINE_RUN_ID = :run_id
+                            )
+                        """, {"run_id": pipeline_run_id})
+                        snap_row = cur.fetchone()
+                        total_snaps = int(snap_row[0]) if snap_row and snap_row[0] else 0
+                        snaps_with_depth = int(snap_row[1]) if snap_row and snap_row[1] else 0
+
                     insert_system_alert(conn, {
                         "alert_type": "PAPER_NO_POSITIONS",
                         "severity_score": 0.4,
                         "details": {
                             "pipeline_run_id": pipeline_run_id,
                             "best_bets_count": len(best_bets_paper),
+                            "orderbook_snapshots_total": total_snaps,
+                            "orderbook_snapshots_with_depth": snaps_with_depth,
+                            "candidates_all_gates_pass": gate_pass_count,
+                            "candidates_kelly_positive": kelly_pass_count,
+                            "avg_edge": round(
+                                sum(edges_for_alert) / len(edges_for_alert), 4
+                            ) if edges_for_alert else None,
+                            "max_edge": round(max(edges_for_alert), 4)
+                                if edges_for_alert else None,
                         },
                     })
+                # ── END FIX 3 ────────────────────────────────────────────
+
             except Exception as e:
                 log.warning("Step 7.5 WARN: paper position creation failed: %s", e)
 
@@ -362,6 +408,12 @@ def _step9_evaluate_gates_ibe(
                   AND sb.P_WIN IS NOT NULL
             """, {"run_id": pipeline_run_id})
         else:
+            # FIX 1: Added  `AND mos.C_VWAP_COMPUTED > 0 AND mos.AVAILABLE_DEPTH > 0`
+            # to exclude empty orderbooks stored as VWAP=0.0/depth=0.
+            # compute_vwap() returns (0.0, 0) for markets with no YES asks,
+            # which passes IS NOT NULL but represents zero liquidity.
+            # Without this filter, c_market=0.0 candidates pass the edge gate
+            # but cause division-by-zero in Kelly and get silently dropped.
             cur.execute("""
                 SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
                        sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
@@ -376,6 +428,8 @@ def _step9_evaluate_gates_ibe(
                 WHERE sb.PIPELINE_RUN_ID = :run_id
                   AND sb.P_WIN IS NOT NULL
                   AND mos.C_VWAP_COMPUTED IS NOT NULL
+                  AND mos.C_VWAP_COMPUTED > 0
+                  AND mos.AVAILABLE_DEPTH > 0
             """, {"run_id": pipeline_run_id})
 
         candidates = []
@@ -568,6 +622,58 @@ def _step9_evaluate_gates_ibe(
         for cand in group_candidates:
             if not cand.get("gate_pass"):
                 continue  # Already added above
+
+    # ── FIX 2: Diagnostic logging — candidate elimination funnel ─────────
+    n_candidates_total = len(candidates)
+    n_gate_pass = sum(1 for b in best_bets if b.get("gate_flags", {}).get("edge", False))
+    n_spread_pass = sum(1 for b in best_bets if b.get("gate_flags", {}).get("spread", False))
+    n_skill_pass = sum(1 for b in best_bets if b.get("gate_flags", {}).get("skill", False))
+    n_all_gates_pass = sum(
+        1 for b in best_bets
+        if all(b.get("gate_flags", {}).get(g, False)
+               for g in ("edge", "spread", "skill", "lead", "reserved"))
+    )
+    n_kelly_positive = sum(1 for b in best_bets if (b.get("f_star") or 0) > 0)
+    n_ibe_veto = sum(1 for b in best_bets if b.get("ibe_veto"))
+    n_selected = sum(1 for b in best_bets if b.get("is_selected_for_execution"))
+
+    # Edge distribution for candidates with real market prices
+    edges = [
+        b["p_win"] - b.get("contract_price", b.get("c_vwap", 0))
+        for b in best_bets
+        if b.get("c_vwap") and b["c_vwap"] > 0
+    ]
+    avg_edge = sum(edges) / len(edges) if edges else 0.0
+    max_edge = max(edges) if edges else 0.0
+
+    log.info(
+        "[gates] funnel: candidates=%d → edge_gate=%d spread=%d skill=%d "
+        "all_gates=%d → kelly_positive=%d ibe_veto=%d → selected=%d "
+        "| avg_edge=%.4f max_edge=%.4f",
+        n_candidates_total, n_gate_pass, n_spread_pass, n_skill_pass,
+        n_all_gates_pass, n_kelly_positive, n_ibe_veto, n_selected,
+        avg_edge, max_edge,
+    )
+
+    if n_candidates_total > 0 and n_selected == 0:
+        # Identify the primary bottleneck for quick diagnosis
+        if n_all_gates_pass == 0:
+            gate_names = ["edge", "spread", "skill", "lead"]
+            fail_counts = {
+                g: sum(1 for b in best_bets
+                       if not b.get("gate_flags", {}).get(g, True))
+                for g in gate_names
+            }
+            worst_gate = max(fail_counts, key=fail_counts.get)
+            bottleneck = f"gate_{worst_gate}_rejected_{fail_counts[worst_gate]}"
+        elif n_kelly_positive == 0:
+            bottleneck = "kelly_no_positive_edge"
+        elif n_ibe_veto > 0:
+            bottleneck = f"ibe_vetoed_{n_ibe_veto}"
+        else:
+            bottleneck = "sizing_chain_below_minimum"
+        log.warning("[gates] bottleneck: %s", bottleneck)
+    # ── END FIX 2 ────────────────────────────────────────────────────────
 
     # Write all best bets
     upsert_best_bets(conn, best_bets)
