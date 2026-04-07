@@ -175,7 +175,6 @@ def main() -> None:
                 n_paper = create_paper_positions(conn, pipeline_run_id)
                 log.info("Step 7.5 OK: %d paper positions created", n_paper)
 
-                # ── FIX 3: Enriched PAPER_NO_POSITIONS alert ─────────────
                 if n_paper == 0:
                     # Compute edge stats for alert details
                     edges_for_alert = [
@@ -215,7 +214,7 @@ def main() -> None:
                         "severity_score": 0.4,
                         "details": {
                             "pipeline_run_id": pipeline_run_id,
-                            "best_bets_count": len(best_bets_paper),
+                            "best_bets_evaluated": len(best_bets_paper),
                             "orderbook_snapshots_total": total_snaps,
                             "orderbook_snapshots_with_depth": snaps_with_depth,
                             "candidates_all_gates_pass": gate_pass_count,
@@ -227,11 +226,10 @@ def main() -> None:
                                 if edges_for_alert else None,
                         },
                     })
-                # ── END FIX 3 ────────────────────────────────────────────
 
             except Exception as e:
                 log.warning("Step 7.5 WARN: paper position creation failed: %s", e)
-
+        
         # Steps 8-10: Live execution (gates, IBE, Kelly, orders)
         if live_mode and client is not None:
             
@@ -349,23 +347,59 @@ def main() -> None:
 # Step helpers
 # ─────────────────────────────────────────────────────────────────────
 
-def _step8_fetch_market_prices(conn: Any, client: Any, run_id: str) -> int:
-    """Fetch order books for all active Shadow Book tickers."""
+def _step8_fetch_market_prices(conn, client, run_id: str) -> int:
+    """Fetch order books for active Shadow Book tickers.
+ 
+    Optimizations over original:
+    1. Skip tickers that had zero depth in the most recent prior snapshot
+       (they're unlikely to have liquidity now).
+    2. Log depth stats so we can see how many markets have real liquidity.
+    """
+    import time as _time
     from kalshicast.execution.vwap import compute_vwap
-
+ 
+    # Get all shadow book tickers for this run
     with conn.cursor() as cur:
         cur.execute("""
             SELECT DISTINCT TICKER FROM SHADOW_BOOK
             WHERE PIPELINE_RUN_ID = :run_id AND P_WIN IS NOT NULL
         """, {"run_id": run_id})
-        tickers = [row[0] for row in cur]
-
+        all_tickers = [row[0] for row in cur]
+ 
+    # Check which tickers had zero depth in the most recent prior snapshot.
+    # Skip those — if the book was empty last run, it's almost certainly
+    # still empty. This avoids thousands of wasted API calls.
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT DISTINCT mos.TICKER
+            FROM (
+                SELECT TICKER, AVAILABLE_DEPTH,
+                       ROW_NUMBER() OVER (PARTITION BY TICKER ORDER BY SNAPSHOT_UTC DESC) rn
+                FROM MARKET_ORDERBOOK_SNAPSHOTS
+            ) mos
+            WHERE mos.rn = 1
+              AND (mos.AVAILABLE_DEPTH IS NULL OR mos.AVAILABLE_DEPTH = 0)
+        """)
+        previously_empty = {row[0] for row in cur}
+ 
+    # Partition: fetch tickers that either (a) had depth before, or (b) are new
+    tickers_to_fetch = [t for t in all_tickers if t not in previously_empty]
+    n_skipped = len(all_tickers) - len(tickers_to_fetch)
+ 
+    if n_skipped > 0:
+        log.info("[step8] skipping %d tickers with previously-empty books "
+                 "(fetching %d of %d)", n_skipped, len(tickers_to_fetch), len(all_tickers))
+ 
     count = 0
-    for ticker in tickers:
+    n_with_depth = 0
+    n_empty = 0
+    t_start = _time.monotonic()
+ 
+    for ticker in tickers_to_fetch:
         try:
             orderbook = client.get_orderbook(ticker)
             c_vwap, depth = compute_vwap(orderbook, 10)
-
+ 
             insert_orderbook_snapshot(conn, {
                 "ticker": ticker,
                 "yes_book": orderbook.get("yes", []),
@@ -374,28 +408,46 @@ def _step8_fetch_market_prices(conn: Any, client: Any, run_id: str) -> int:
                 "available_depth": depth,
             })
             count += 1
+            if depth > 0 and c_vwap > 0:
+                n_with_depth += 1
+            else:
+                n_empty += 1
         except Exception as e:
             log.warning("Orderbook fetch failed for %s: %s", ticker, e)
-
+ 
+    elapsed = _time.monotonic() - t_start
+    log.info("[step8] fetched %d orderbooks in %.1fs: %d with depth, %d empty, "
+             "%d skipped (previously empty)",
+             count, elapsed, n_with_depth, n_empty, n_skipped)
+ 
     conn.commit()
     return count
-
-
+ 
+ 
+# ─────────────────────────────────────────────────────────────────────
+# REPLACEMENT: _step9_evaluate_gates_ibe
+# ─────────────────────────────────────────────────────────────────────
+#
+# Changes from v1 patch:
+# - Funnel logging now fires in BOTH paths: the early-exit when zero
+#   candidates match the SQL query, AND the normal gate/Kelly path.
+# - When zero candidates, logs WHY: how many shadow book rows existed,
+#   how many snapshots had depth, so you can see the filter is working.
+ 
 def _step9_evaluate_gates_ibe(
-    conn: Any,
+    conn,
     pipeline_run_id: str,
     bankroll: float,
-    target_dates: list[str],
+    target_dates: list,
     paper_mode: bool = False,
-) -> list[dict]:
+) -> list:
     """Evaluate conviction gates, IBE signals, Kelly sizing for all candidates."""
     from kalshicast.execution.gates import evaluate_all_gates
     from kalshicast.execution.ibe import evaluate_ibe
     from kalshicast.execution.kelly import smirnov_kelly, full_sizing_chain
     from kalshicast.execution.positions import get_remaining_capacity
-
+ 
     # Get Shadow Book candidates with market prices
-    # In paper mode, use P_WIN as synthetic market price (no orderbook data available)
     with conn.cursor() as cur:
         if paper_mode:
             cur.execute("""
@@ -408,12 +460,6 @@ def _step9_evaluate_gates_ibe(
                   AND sb.P_WIN IS NOT NULL
             """, {"run_id": pipeline_run_id})
         else:
-            # FIX 1: Added  `AND mos.C_VWAP_COMPUTED > 0 AND mos.AVAILABLE_DEPTH > 0`
-            # to exclude empty orderbooks stored as VWAP=0.0/depth=0.
-            # compute_vwap() returns (0.0, 0) for markets with no YES asks,
-            # which passes IS NOT NULL but represents zero liquidity.
-            # Without this filter, c_market=0.0 candidates pass the edge gate
-            # but cause division-by-zero in Kelly and get silently dropped.
             cur.execute("""
                 SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
                        sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
@@ -431,7 +477,7 @@ def _step9_evaluate_gates_ibe(
                   AND mos.C_VWAP_COMPUTED > 0
                   AND mos.AVAILABLE_DEPTH > 0
             """, {"run_id": pipeline_run_id})
-
+ 
         candidates = []
         for row in cur:
             candidates.append({
@@ -447,12 +493,49 @@ def _step9_evaluate_gates_ibe(
                 "c_market": float(row[10]) if row[10] else 0.0,
                 "available_depth": int(row[11]) if row[11] else 0,
             })
-
+ 
+    # ── EARLY EXIT: no candidates with real market depth ─────────────
     if not candidates:
+        # Count what exists so we can diagnose WHY there are zero candidates
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) FROM SHADOW_BOOK
+                WHERE PIPELINE_RUN_ID = :run_id AND P_WIN IS NOT NULL
+            """, {"run_id": pipeline_run_id})
+            n_shadow_rows = cur.fetchone()[0] or 0
+ 
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN C_VWAP_COMPUTED > 0 AND AVAILABLE_DEPTH > 0
+                         THEN 1 ELSE 0 END) AS with_depth,
+                    SUM(CASE WHEN C_VWAP_COMPUTED = 0 OR AVAILABLE_DEPTH = 0
+                         THEN 1 ELSE 0 END) AS empty
+                FROM MARKET_ORDERBOOK_SNAPSHOTS mos
+                WHERE EXISTS (
+                    SELECT 1 FROM SHADOW_BOOK sb
+                    WHERE sb.TICKER = mos.TICKER
+                      AND sb.PIPELINE_RUN_ID = :run_id
+                )
+            """, {"run_id": pipeline_run_id})
+            snap_row = cur.fetchone()
+            n_snaps = int(snap_row[0]) if snap_row and snap_row[0] else 0
+            n_with_depth = int(snap_row[1]) if snap_row and snap_row[1] else 0
+            n_empty = int(snap_row[2]) if snap_row and snap_row[2] else 0
+ 
+        log.warning(
+            "[gates] zero candidates with real market depth. "
+            "shadow_book_rows=%d orderbook_snapshots=%d "
+            "(with_depth=%d empty=%d). "
+            "All markets are either illiquid or not fetched.",
+            n_shadow_rows, n_snaps, n_with_depth, n_empty,
+        )
         return []
-
+    # ── END EARLY EXIT ───────────────────────────────────────────────
+ 
     # Get ensemble state for spread info
-    ensemble_cache: dict[str, dict] = {}
+    ensemble_cache = {}
     with conn.cursor() as cur:
         cur.execute("""
             SELECT STATION_ID, TARGET_DATE, TARGET_TYPE, S_TK, F_BAR_TK, SIGMA_EFF
@@ -466,9 +549,9 @@ def _step9_evaluate_gates_ibe(
                 "f_bar": float(row[4]) if row[4] else 0.0,
                 "sigma_eff": float(row[5]) if row[5] else 3.0,
             }
-
+ 
     # Get BSS info
-    bss_cache: dict[str, dict] = {}
+    bss_cache = {}
     with conn.cursor() as cur:
         cur.execute("SELECT STATION_ID, TARGET_TYPE, LEAD_BRACKET, BSS_1, IS_QUALIFIED FROM BSS_MATRIX")
         for row in cur:
@@ -477,46 +560,46 @@ def _step9_evaluate_gates_ibe(
                 "bss": float(row[3]) if row[3] else None,
                 "qualified": bool(row[4]),
             }
-
+ 
     # Count existing bets for adaptive edge buffer
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM POSITIONS WHERE STATUS IN ('OPEN', 'FILLED')")
         n_bets = cur.fetchone()[0] or 0
-
+ 
     # Get station WFO mapping
-    wfo_map: dict[str, str] = {}
+    wfo_map = {}
     with conn.cursor() as cur:
         cur.execute("SELECT STATION_ID, WFO_ID FROM STATIONS WHERE IS_ACTIVE = 1")
         for row in cur:
             wfo_map[row[0]] = row[1] or "UNK"
-
+ 
     # Get MDD for drawdown scaling
     with conn.cursor() as cur:
         cur.execute("SELECT MDD_ALLTIME FROM FINANCIAL_METRICS ORDER BY METRIC_DATE DESC FETCH FIRST 1 ROWS ONLY")
         row = cur.fetchone()
         mdd = float(row[0]) if row and row[0] else 0.0
-
+ 
     # Group candidates by station/date/type for Smirnov Kelly
     from collections import defaultdict
-    groups: dict[str, list[dict]] = defaultdict(list)
+    groups = defaultdict(list)
     for c in candidates:
         key = f"{c['station_id']}|{c['target_date']}|{c['target_type']}"
         groups[key].append(c)
-
-    best_bets: list[dict] = []
-
+ 
+    best_bets = []
+ 
     for group_key, group_candidates in groups.items():
         parts = group_key.split("|")
         sid, td, tt = parts[0], parts[1], parts[2]
-
+ 
         ens_key = group_key
         ens = ensemble_cache.get(ens_key, {"s_tk": 3.0, "f_bar": 0.0, "sigma_eff": 3.0})
-
+ 
         # Evaluate gates for each candidate
         for cand in group_candidates:
-            bss_key = f"{sid}|{tt}|h3"  # Default bracket
+            bss_key = f"{sid}|{tt}|h3"
             bss_info = bss_cache.get(bss_key, {"bss": None, "qualified": False})
-
+ 
             gate_result = evaluate_all_gates({
                 "p_win": cand["p_win"],
                 "c_market": cand["c_market"],
@@ -525,35 +608,33 @@ def _step9_evaluate_gates_ibe(
                 "s_tk": ens["s_tk"],
                 "bss": bss_info["bss"],
                 "was_qualified": bss_info["qualified"],
-                "lead_hours": 24.0,  # Default; compute from target_date in production
+                "lead_hours": 24.0,
             })
-
+ 
             cand["gate_pass"] = gate_result["pass"]
             cand["gate_flags"] = gate_result["flags"]
             cand["gate_details"] = gate_result["details"]
-
+ 
         # Filter to gate-passing candidates
         passing = [c for c in group_candidates if c.get("gate_pass")]
         if not passing:
-            # Still record all as non-selected
             for cand in group_candidates:
                 best_bets.append(_make_best_bet(cand, pipeline_run_id, selected=False))
             continue
-
+ 
         # Smirnov Kelly on passing bins
         kelly_bins = [{"p_win": c["p_win"], "c_market": c["c_market"],
                        "ticker": c["ticker"]} for c in passing]
         kelly_result = smirnov_kelly(kelly_bins)
         kelly_map = {r["ticker"]: r.get("f_star", 0.0) for r in kelly_result}
-
+ 
         # Evaluate IBE and full sizing for each passing candidate
         for cand in passing:
             f_star = kelly_map.get(cand["ticker"], 0.0)
             if f_star <= 0:
                 best_bets.append(_make_best_bet(cand, pipeline_run_id, selected=False))
                 continue
-
-            # IBE evaluation
+ 
             prev_sb = get_previous_shadow_book(conn, cand["ticker"])
             ibe_result = evaluate_ibe(conn, {
                 "station_id": sid,
@@ -570,14 +651,13 @@ def _step9_evaluate_gates_ibe(
                 "sigma_hist": ens["sigma_eff"],
                 "b_k": 0.0,
             })
-
-            # Log IBE
+ 
             insert_ibe_signal_log(conn, {
                 "ticker": cand["ticker"],
                 "pipeline_run_id": pipeline_run_id,
                 **ibe_result,
             })
-
+ 
             if ibe_result["veto"]:
                 best_bets.append(_make_best_bet(
                     cand, pipeline_run_id, selected=False,
@@ -585,14 +665,13 @@ def _step9_evaluate_gates_ibe(
                     ibe_veto=True, f_star=f_star,
                 ))
                 continue
-
-            # Full sizing chain
+ 
             wfo = wfo_map.get(sid, "UNK")
             remaining = get_remaining_capacity(conn, sid, td, wfo, bankroll)
-
+ 
             from kalshicast.execution.kelly import compute_market_convergence
             gamma, gamma_scale = compute_market_convergence({}, "")
-
+ 
             sizing = full_sizing_chain(
                 f_star=f_star,
                 bss=bss_info["bss"] or 0.0,
@@ -603,9 +682,9 @@ def _step9_evaluate_gates_ibe(
                 remaining_capacity=remaining,
                 c_market=cand["c_market"],
             )
-
+ 
             selected = not sizing.get("skip", True) and sizing.get("contracts", 0) > 0
-
+ 
             bet = _make_best_bet(
                 cand, pipeline_run_id, selected=selected,
                 ibe_composite=ibe_result["composite"],
@@ -617,13 +696,13 @@ def _step9_evaluate_gates_ibe(
                 contracts=sizing.get("contracts", 0),
             )
             best_bets.append(bet)
-
+ 
         # Non-passing candidates
         for cand in group_candidates:
             if not cand.get("gate_pass"):
                 continue  # Already added above
-
-    # ── FIX 2: Diagnostic logging — candidate elimination funnel ─────────
+ 
+    # ── Diagnostic logging: candidate elimination funnel ─────────────
     n_candidates_total = len(candidates)
     n_gate_pass = sum(1 for b in best_bets if b.get("gate_flags", {}).get("edge", False))
     n_spread_pass = sum(1 for b in best_bets if b.get("gate_flags", {}).get("spread", False))
@@ -636,8 +715,7 @@ def _step9_evaluate_gates_ibe(
     n_kelly_positive = sum(1 for b in best_bets if (b.get("f_star") or 0) > 0)
     n_ibe_veto = sum(1 for b in best_bets if b.get("ibe_veto"))
     n_selected = sum(1 for b in best_bets if b.get("is_selected_for_execution"))
-
-    # Edge distribution for candidates with real market prices
+ 
     edges = [
         b["p_win"] - b.get("contract_price", b.get("c_vwap", 0))
         for b in best_bets
@@ -645,7 +723,7 @@ def _step9_evaluate_gates_ibe(
     ]
     avg_edge = sum(edges) / len(edges) if edges else 0.0
     max_edge = max(edges) if edges else 0.0
-
+ 
     log.info(
         "[gates] funnel: candidates=%d → edge_gate=%d spread=%d skill=%d "
         "all_gates=%d → kelly_positive=%d ibe_veto=%d → selected=%d "
@@ -654,9 +732,8 @@ def _step9_evaluate_gates_ibe(
         n_all_gates_pass, n_kelly_positive, n_ibe_veto, n_selected,
         avg_edge, max_edge,
     )
-
+ 
     if n_candidates_total > 0 and n_selected == 0:
-        # Identify the primary bottleneck for quick diagnosis
         if n_all_gates_pass == 0:
             gate_names = ["edge", "spread", "skill", "lead"]
             fail_counts = {
@@ -673,12 +750,12 @@ def _step9_evaluate_gates_ibe(
         else:
             bottleneck = "sizing_chain_below_minimum"
         log.warning("[gates] bottleneck: %s", bottleneck)
-    # ── END FIX 2 ────────────────────────────────────────────────────────
-
+    # ── END funnel logging ───────────────────────────────────────────
+ 
     # Write all best bets
     upsert_best_bets(conn, best_bets)
     conn.commit()
-
+ 
     return [b for b in best_bets if b.get("is_selected_for_execution")]
 
 
