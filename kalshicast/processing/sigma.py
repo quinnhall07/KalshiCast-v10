@@ -23,15 +23,44 @@ def compute_per_model_rmse(errors: list[float]) -> float:
         return 0.0
     return math.sqrt(sum(e * e for e in errors) / len(errors))
 
+
 def compute_global_rmse(station_rmses: dict[str, float]) -> float:
     """Compute the global RMSE prior across all stations.
-    
+
     Averages the individual station RMSEs to use as the global baseline
     for Bayesian shrinkage.
     """
     if not station_rmses:
         return 0.0
     return sum(station_rmses.values()) / len(station_rmses)
+
+
+def compute_global_rmse_sql(conn: Any, target_type: str, lead_bracket: str,
+                            window_days: int) -> float:
+    """Compute RMSE across all stations for a (target_type, lead_bracket) cell.
+
+    Single SQL query — more efficient than per-station loop.
+    Used as the prior in Bayesian shrinkage. Falls back to SIGMA_FLOOR
+    if no cross-station errors exist.
+    """
+    sql = """
+    SELECT SQRT(AVG(
+        CASE WHEN ERROR_ADJUSTED IS NOT NULL THEN ERROR_ADJUSTED * ERROR_ADJUSTED
+             ELSE ERROR_RAW * ERROR_RAW END
+    )) AS GLOBAL_RMSE
+    FROM FORECAST_ERRORS
+    WHERE TARGET_TYPE = :tt AND LEAD_BRACKET = :lb
+      AND TARGET_DATE >= TRUNC(SYSDATE) - :window
+      AND (ERROR_ADJUSTED IS NOT NULL OR ERROR_RAW IS NOT NULL)
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"tt": target_type, "lb": lead_bracket,
+                          "window": window_days})
+        row = cur.fetchone()
+    if row and row[0] is not None:
+        return max(float(row[0]), 0.1)
+    return SIGMA_FLOOR
+
 
 def bayesian_shrinkage(station_rmse: float, global_rmse: float,
                        n: int, m_prior: int | None = None) -> float:
@@ -64,7 +93,6 @@ def compute_sigma_for_pricing(conn: Any, station_id: str, target_type: str,
     for every station inside a batch run.
     """
     from kalshicast.db.operations import get_forecast_errors_window
-    from kalshicast.config import get_stations
 
     window = get_param_int("sigma.rmse_window_days")
     m_prior = get_param_int("sigma.m_prior")
@@ -89,31 +117,12 @@ def compute_sigma_for_pricing(conn: Any, station_id: str, target_type: str,
     if station_rmse == 0:
         return SIGMA_FLOOR
 
-    # Compute global RMSE across all stations for the same (type, bracket).
-    # Use cache to avoid O(N_stations²) DB queries when called in a batch loop.
+    # Real global RMSE via single SQL query, with cache to avoid repeated calls
     cache_key = (target_type, lead_bracket)
     if global_rmse_cache is not None and cache_key in global_rmse_cache:
         global_rmse = global_rmse_cache[cache_key]
     else:
-        stations = get_stations(active_only=True)
-        station_rmses: dict[str, float] = {}
-        for st in stations:
-            sid = st["station_id"]
-            if sid == station_id:
-                station_rmses[sid] = station_rmse
-                continue
-            rows = get_forecast_errors_window(
-                conn, sid, None, target_type, lead_bracket, window
-            )
-            errs = []
-            for e in rows:
-                val = e.get("error_adjusted") if e.get("error_adjusted") is not None else e.get("error_raw")
-                if val is not None:
-                    errs.append(float(val))
-            if errs:
-                station_rmses[sid] = compute_per_model_rmse(errs)
-
-        global_rmse = compute_global_rmse(station_rmses) if station_rmses else SIGMA_FLOOR
+        global_rmse = compute_global_rmse_sql(conn, target_type, lead_bracket, window)
         if global_rmse_cache is not None:
             global_rmse_cache[cache_key] = global_rmse
 

@@ -133,10 +133,46 @@ def kalman_update(
     return new_state, history
 
 
-def _compute_ewm_variance(delta_b_series: list[float], span: int = 90) -> float:
-    """Exponentially weighted moving variance of ΔB series for Q_base."""
+def _adaptive_ewm_span(delta_b_series: list[float],
+                       span_stable: int = 90, span_volatile: int = 20,
+                       vol_threshold: float = 2.0) -> int:
+    """Choose EWM span based on recent volatility.
+
+    Uses the ratio of short-window variance to long-window variance.
+    High ratio → volatile regime → shorter span for faster adaptation.
+    """
+    n = len(delta_b_series)
+    if n < span_volatile:
+        return span_stable
+
+    recent = delta_b_series[-span_volatile:]
+    mean_r = sum(recent) / len(recent)
+    var_r = sum((x - mean_r) ** 2 for x in recent) / len(recent)
+
+    mean_all = sum(delta_b_series) / n
+    var_all = sum((x - mean_all) ** 2 for x in delta_b_series) / n
+
+    if var_all <= 0:
+        return span_stable
+
+    vol_ratio = var_r / var_all
+    if vol_ratio > vol_threshold:
+        return span_volatile
+    # Linear interpolation between volatile and stable spans
+    t = min(vol_ratio / vol_threshold, 1.0)
+    return int(span_stable - t * (span_stable - span_volatile))
+
+
+def _compute_ewm_variance(delta_b_series: list[float], span: int = 0) -> float:
+    """Exponentially weighted moving variance of ΔB series for Q_base.
+
+    When span=0 (default), uses adaptive span based on recent volatility.
+    """
     if len(delta_b_series) < 2:
         return 0.01  # small default
+
+    if span <= 0:
+        span = _adaptive_ewm_span(delta_b_series)
 
     alpha = 2.0 / (span + 1)
     mean = 0.0
@@ -168,7 +204,7 @@ def update_kalman_filters(conn: Any, target_date: str, run_id: str) -> int:
     """
     from kalshicast.db.operations import (
         get_kalman_state, upsert_kalman_state, insert_kalman_history,
-        get_forecast_errors_window,
+        get_forecast_errors_window, get_latest_ensemble_state,
     )
     from kalshicast.config import get_stations
 
@@ -216,8 +252,12 @@ def update_kalman_filters(conn: Any, target_date: str, run_id: str) -> int:
             epsilon_k = float(target_err["error_raw"])
             f_raw = float(target_err["f_raw"]) if target_err.get("f_raw") is not None else 0.0
 
-            # Compute R_k (need ensemble spread — use 0 as default if not available)
-            R_k = compute_R_k(f_raw, f_raw, 0.0)  # simplified: spread not yet available in night
+            # Compute R_k using real ensemble spread if available
+            ens = get_latest_ensemble_state(conn, station_id, target_type)
+            if ens and ens["s_tk"] > 0:
+                R_k = compute_R_k(ens["f_tk_top"], ens["f_bar_tk"], ens["s_tk"])
+            else:
+                R_k = compute_R_k(f_raw, f_raw, 0.0)
 
             # Compute gap days
             gap_days = 0

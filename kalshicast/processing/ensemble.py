@@ -246,6 +246,40 @@ def _compute_per_source_skill(conn: Any, station_id: str, target_type: str,
     ]
 
 
+def _compute_per_source_skill_cached(
+    error_cache: dict[str, list[float]],
+    station_id: str, target_type: str,
+    lead_bracket: str, source_ids: list[str],
+    min_samples: int = 5,
+) -> list[float]:
+    """Batch-cached version of _compute_per_source_skill.
+
+    Uses pre-fetched error_cache instead of per-source DB queries.
+    """
+    source_mse: dict[str, float] = {}
+
+    for src in source_ids:
+        errs = error_cache.get(f"rmse|{station_id}|{target_type}|{lead_bracket}|{src}", [])
+        if len(errs) >= min_samples:
+            source_mse[src] = sum(e * e for e in errs) / len(errs)
+
+    if len(source_mse) < 2:
+        if len(source_mse) == 1:
+            only_src = next(iter(source_mse))
+            return [1.0 if src == only_src else 0.0 for src in source_ids]
+        return [0.0] * len(source_ids)
+
+    mse_baseline = max(source_mse.values())
+    if mse_baseline <= 0:
+        return [0.0] * len(source_ids)
+
+    return [
+        max(0.0, 1.0 - source_mse[src] / mse_baseline)
+        if src in source_mse else 0.0
+        for src in source_ids
+    ]
+
+
 def _select_top_from_skill(skill_scores: list[float], source_ids: list[str],
                             source_forecasts: dict[str, float]) -> str | None:
     """Pick the source with highest skill score.
@@ -281,12 +315,14 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
 
     Returns count of ensemble rows written.
     """
+    from collections import defaultdict
     from kalshicast.db.operations import (
-        get_latest_forecasts_for_date, get_forecast_errors_window,
+        get_latest_forecasts_for_date,
         upsert_ensemble_state, upsert_model_weights,
-        get_kalman_state,
     )
     from kalshicast.config import get_stations
+    from kalshicast.processing.sigma import compute_per_model_rmse, bayesian_shrinkage
+    from kalshicast.processing.regime import detect_bimodal
 
     stations = get_stations(active_only=True)
     min_models = get_param_int("ensemble.min_models")
@@ -307,10 +343,56 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
                 fc_by_cell[key] = []
             fc_by_cell[key].append(fc)
 
+    # ── Batch pre-fetch: Kalman states ──
+    kalman_cache: dict[str, dict] = {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT STATION_ID, TARGET_TYPE, B_K, TOP_MODEL_ID FROM KALMAN_STATE")
+        for row in cur:
+            key = f"{row[0]}|{row[1]}"
+            kalman_cache[key] = {
+                "b_k": float(row[2]) if row[2] is not None else 0.0,
+                "top_model_id": row[3],
+            }
+
+    # ── Batch pre-fetch: all forecast errors for skewness + RMSE ──
+    error_cache: dict[str, list[float]] = defaultdict(list)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT STATION_ID, SOURCE_ID, TARGET_TYPE, LEAD_BRACKET,
+                   ERROR_ADJUSTED, ERROR_RAW
+            FROM FORECAST_ERRORS
+            WHERE TARGET_DATE >= TRUNC(SYSDATE) - :window
+              AND (ERROR_ADJUSTED IS NOT NULL OR ERROR_RAW IS NOT NULL)
+        """, {"window": window})
+        for row in cur:
+            sid, src, tt, lb_val, e_adj, e_raw = row
+            val = float(e_adj if e_adj is not None else e_raw)
+            # Key for skewness: station|source|type|bracket
+            error_cache[f"{sid}|{src}|{tt}|{lb_val}"].append(val)
+            # Key for per-source RMSE: station|type|bracket|source
+            error_cache[f"rmse|{sid}|{tt}|{lb_val}|{src}"].append(val)
+
+    # ── Batch pre-fetch: global RMSE per (target_type, lead_bracket) ──
+    global_rmse_cache: dict[str, float] = {}
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT TARGET_TYPE, LEAD_BRACKET,
+                   SQRT(AVG(
+                       CASE WHEN ERROR_ADJUSTED IS NOT NULL
+                            THEN ERROR_ADJUSTED * ERROR_ADJUSTED
+                            ELSE ERROR_RAW * ERROR_RAW END
+                   )) AS GLOBAL_RMSE
+            FROM FORECAST_ERRORS
+            WHERE TARGET_DATE >= TRUNC(SYSDATE) - :window
+              AND (ERROR_ADJUSTED IS NOT NULL OR ERROR_RAW IS NOT NULL)
+            GROUP BY TARGET_TYPE, LEAD_BRACKET
+        """, {"window": window})
+        for row in cur:
+            global_rmse_cache[f"{row[0]}|{row[1]}"] = float(row[2]) if row[2] else SIGMA_FLOOR
+
     ensemble_rows = []
     weight_rows = []
     count = 0
-    global_rmse_cache: dict[tuple[str, str], float] = {}
 
     for st in stations:
         station_id = st["station_id"]
@@ -342,12 +424,13 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
             lb = fc0.get("lead_bracket_high") if target_type == "HIGH" else fc0.get("lead_bracket_low")
             lb = lb or "h2"
 
-            # Pre-fetch Kalman state (used by both top model selection and bias correction)
-            ks = get_kalman_state(conn, station_id, target_type)
+            # Kalman state from batch cache
+            ks_key = f"{station_id}|{target_type}"
+            ks = kalman_cache.get(ks_key)
 
-            # Per-source skill from forecast error history (cold start → uniform)
-            bss_scores = _compute_per_source_skill(
-                conn, station_id, target_type, lb, source_ids, window
+            # Per-source skill from cached error history (cold start → uniform)
+            bss_scores = _compute_per_source_skill_cached(
+                error_cache, station_id, target_type, lb, source_ids
             )
 
             # Top model = highest skill source (consistent with weight derivation)
@@ -355,8 +438,8 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
                 bss_scores, source_ids, source_forecasts
             )
             if top_model is None:
-                # Cold start: fall back to BSS_MATRIX → KALMAN_STATES → first
-                top_model = select_top_model(conn, station_id, lb, target_type, kalman_state=ks)
+                # Cold start: fall back to Kalman state → first available
+                top_model = ks["top_model_id"] if ks and ks.get("top_model_id") else None
                 if top_model is None or top_model not in source_forecasts:
                     top_model = source_ids[0]
 
@@ -371,22 +454,31 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
             # Spreads
             s_unweighted, s_weighted = compute_spread(fc_values, weights)
 
-            # Sigma
-            sigma_adj = compute_sigma_for_pricing(
-                conn, station_id, target_type, lb,
-                global_rmse_cache=global_rmse_cache,
-            )
+            # Sigma from cached errors (replaces per-iteration DB call)
+            station_errs = []
+            for sid in source_ids:
+                station_errs.extend(error_cache.get(
+                    f"rmse|{station_id}|{target_type}|{lb}|{sid}", []))
+            if station_errs:
+                station_rmse = compute_per_model_rmse(station_errs)
+                g_rmse = global_rmse_cache.get(f"{target_type}|{lb}", SIGMA_FLOOR)
+                sigma_adj = bayesian_shrinkage(station_rmse, g_rmse, len(station_errs))
+                sigma_adj = max(sigma_adj, 0.1)
+            else:
+                sigma_adj = SIGMA_FLOOR
 
-            # Skewness from error history
-            errors_for_skew = get_forecast_errors_window(
-                conn, station_id, top_model, target_type, lb, window
-            )
-            err_vals = [
-                float(e["error_adjusted"] if e.get("error_adjusted") is not None else e.get("error_raw"))
-                for e in errors_for_skew
-                if (e.get("error_adjusted") is not None or e.get("error_raw") is not None)
-            ]
+            # Skewness from cached error history
+            err_vals = error_cache.get(
+                f"{station_id}|{top_model}|{target_type}|{lb}", [])
             g1_s = compute_skewness(err_vals)
+
+            # Regime-aware sigma inflation when bimodal detected
+            bimodal = detect_bimodal(fc_values, s_unweighted)
+            if bimodal is not None:
+                centroid_dist = bimodal["centroid_distance"]
+                sigma_adj = max(sigma_adj, centroid_dist / 2.0)
+                log.info("[ensemble] %s/%s bimodal: inflating sigma_adj to %.2f",
+                         station_id, target_type, sigma_adj)
 
             # σ_eff
             sigma_eff = compute_sigma_eff(sigma_adj, s_weighted)

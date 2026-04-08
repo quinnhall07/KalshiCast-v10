@@ -803,6 +803,66 @@ def get_forecast_errors_window(conn: Any, station_id: str, source_id: str | None
         return [dict(zip(cols, row)) for row in cur]
 
 
+def get_per_source_rmse(conn: Any, station_id: str, target_type: str,
+                        lead_bracket: str, source_ids: list[str],
+                        window_days: int) -> dict[str, tuple[float, int]]:
+    """Get RMSE per source for a (station, target_type, lead_bracket) cell.
+
+    Returns {source_id: (rmse, n_obs)} for each source that has errors.
+    """
+    if not source_ids:
+        return {}
+    placeholders = ", ".join(f":s{i}" for i in range(len(source_ids)))
+    sql = f"""
+    SELECT SOURCE_ID,
+           SQRT(AVG(ERROR_RAW * ERROR_RAW)) AS RMSE,
+           COUNT(*) AS N
+    FROM FORECAST_ERRORS
+    WHERE STATION_ID = :sid
+      AND TARGET_TYPE = :tt
+      AND LEAD_BRACKET = :lb
+      AND TARGET_DATE >= TRUNC(SYSDATE) - :window
+      AND ERROR_RAW IS NOT NULL
+      AND SOURCE_ID IN ({placeholders})
+    GROUP BY SOURCE_ID
+    """
+    bind = {"sid": station_id, "tt": target_type, "lb": lead_bracket,
+            "window": window_days}
+    for i, sid in enumerate(source_ids):
+        bind[f"s{i}"] = sid
+
+    with conn.cursor() as cur:
+        cur.execute(sql, bind)
+        return {row[0]: (float(row[1]), int(row[2])) for row in cur}
+
+
+def get_latest_ensemble_state(conn: Any, station_id: str,
+                              target_type: str) -> dict | None:
+    """Get the most recent ENSEMBLE_STATE for a (station, target_type).
+
+    Returns dict with s_tk, s_weighted_tk, f_bar_tk, f_tk_top, or None.
+    """
+    sql = """
+    SELECT S_TK, S_WEIGHTED_TK, F_BAR_TK, F_TK_TOP, SIGMA_EFF
+    FROM ENSEMBLE_STATE
+    WHERE STATION_ID = :sid AND TARGET_TYPE = :tt
+    ORDER BY TARGET_DATE DESC
+    FETCH FIRST 1 ROWS ONLY
+    """
+    with conn.cursor() as cur:
+        cur.execute(sql, {"sid": station_id, "tt": target_type})
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "s_tk": float(row[0]) if row[0] is not None else 0.0,
+        "s_weighted_tk": float(row[1]) if row[1] is not None else 0.0,
+        "f_bar_tk": float(row[2]) if row[2] is not None else 0.0,
+        "f_tk_top": float(row[3]) if row[3] is not None else 0.0,
+        "sigma_eff": float(row[4]) if row[4] is not None else 0.0,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Shadow Book — write
 # ─────────────────────────────────────────────────────────────────────
