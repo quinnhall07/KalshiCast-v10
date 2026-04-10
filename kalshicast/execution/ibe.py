@@ -237,16 +237,28 @@ def compute_scas(
     """SCAS = |B_seasonal - B_k| / σ_hist.
 
     B_seasonal = rolling 15-day mean of historical Kalman biases for this DOY.
+    Uses a ±7 day window around the current day-of-year across all available
+    years, so summer biases don't contaminate winter estimates and vice versa.
     SCAS_mod = max(0.6, 1 - scas_scale × SCAS). No veto.
     """
     scas_scale = get_param_float("ibe.scas_scale")
 
-    # Get historical bias for seasonal comparison
+    # Get historical bias using ±7 day DOY window (spec §7.3)
+    # The >= 358 clause handles year-boundary wrap (e.g. DOY 1 vs DOY 365)
     with conn.cursor() as cur:
         cur.execute("""
             SELECT AVG(B_K) FROM KALMAN_HISTORY
             WHERE STATION_ID = :sid AND TARGET_TYPE = :tt
-              AND CREATED_AT >= SYSTIMESTAMP - INTERVAL '365' DAY
+              AND (
+                  ABS(
+                      TO_NUMBER(TO_CHAR(CREATED_AT, 'DDD'))
+                      - TO_NUMBER(TO_CHAR(SYSTIMESTAMP, 'DDD'))
+                  ) <= 7
+                  OR ABS(
+                      TO_NUMBER(TO_CHAR(CREATED_AT, 'DDD'))
+                      - TO_NUMBER(TO_CHAR(SYSTIMESTAMP, 'DDD'))
+                  ) >= 358
+              )
         """, {"sid": station_id, "tt": target_type})
         row = cur.fetchone()
         b_seasonal = float(row[0]) if row and row[0] is not None else 0.0
