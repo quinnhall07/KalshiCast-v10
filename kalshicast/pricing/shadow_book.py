@@ -163,6 +163,10 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
         log.warning("[shadow_book] no ensemble state for run %s", run_id)
         return 0
 
+    # Build station_id → cli_site mapping for Kalshi ticker generation
+    from kalshicast.config.stations import STATIONS as _ALL_STATIONS
+    station_cli_map = {s["station_id"]: s.get("cli_site", s["station_id"].lstrip("K")) for s in _ALL_STATIONS}
+
     # 2. BULK FETCH: Kalman States
     # Fetch all Kalman states at once instead of querying per-station inside the loop
     kalman_cache: dict[str, float] = {}
@@ -217,7 +221,9 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
         xi_s, omega_s, alpha_s = convert_to_skewnorm_params(mu, sigma_eff, g1_s)
 
         # Generate bins
-        bins = generate_station_bins(station_id, target_date, mu, target_type)
+        # Look up Kalshi city code from station config
+        _cli_site = station_cli_map.get(station_id)
+        bins = generate_station_bins(station_id, target_date, mu, target_type, cli_site=_cli_site)
 
         # Compute P(win) for each bin
         probs = [compute_p_win(b["bin_lower"], b["bin_upper"], xi_s, omega_s, alpha_s) for b in bins]
