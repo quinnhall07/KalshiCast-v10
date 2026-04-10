@@ -587,8 +587,7 @@ def get_kalman_state(conn: Any, station_id: str, target_type: str) -> dict | Non
     """Read current Kalman state for (station, type). Returns None if not initialized."""
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT B_K, U_K, Q_BASE, STATE_VERSION, TOP_MODEL_ID,
-                   LAST_OBSERVATION_DATE, LAST_UPDATED_UTC
+            SELECT B_K, U_K, Q_BASE, STATE_VERSION, TOP_MODEL_ID, LAST_OBSERVATION_DATE, LAST_UPDATED_UTC
             FROM KALMAN_STATES
             WHERE STATION_ID = :sid AND TARGET_TYPE = :tt
         """, {"sid": station_id, "tt": target_type})

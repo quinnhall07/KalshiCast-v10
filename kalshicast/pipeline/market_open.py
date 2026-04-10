@@ -105,7 +105,7 @@ def main() -> None:
             log.info("Step 6 OK: %d ensemble states across %d dates",
                      total_ensemble, len(target_dates))
         except Exception as e:
-            log.error("Step 6 ERROR: ensemble computation failed: %s", e)
+            log.error("Step 6 ERROR: ensemble computation failed: %s", e, exc_info=True)
             status = STATUS_PARTIAL
             insert_system_alert(conn, {
                 "alert_type": "ENSEMBLE_COMPUTATION_FAILED",
