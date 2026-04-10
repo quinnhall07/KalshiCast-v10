@@ -346,7 +346,7 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
     # ── Batch pre-fetch: Kalman states ──
     kalman_cache: dict[str, dict] = {}
     with conn.cursor() as cur:
-        cur.execute("SELECT STATION_ID, TARGET_TYPE, B_K, TOP_MODEL_ID FROM KALMAN_STATE")
+        cur.execute("SELECT STATION_ID, TARGET_TYPE, B_K, TOP_MODEL_ID FROM KALMAN_STATES")
         for row in cur:
             key = f"{row[0]}|{row[1]}"
             kalman_cache[key] = {
