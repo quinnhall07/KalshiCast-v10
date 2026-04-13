@@ -174,88 +174,104 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
     
     # Track which events we've already alerted on this run
     alerted_events: set[str] = set()
-    
-    for series in ["KXHIGH", "KXLOW"]:
-        try:
-            events = client.get_events(status="open", series_ticker=series)
-        except Exception as e:
-            log.error("Failed to fetch %s events: %s", series, e)
-            errors += 1
+
+    # Fetch all open events in one call and filter client-side.
+    # Kalshi's series_ticker is per-city (e.g. KXHIGHNYC, KXLOWMIA), so a
+    # filter of series_ticker="KXHIGH" returns nothing. Fetching unfiltered
+    # and prefix-matching event_ticker is robust to the exact series naming.
+    try:
+        all_events = client.get_events(status="open", limit=200)
+    except Exception as e:
+        log.error("Failed to fetch Kalshi events: %s", e)
+        return SyncResult(synced=0, unmatched=0, ignored=0, errors=1)
+
+    weather_events = [
+        e for e in all_events
+        if e.get("event_ticker", "").startswith(("KXHIGH", "KXLOW"))
+    ]
+    log.info("Kalshi: fetched %d open events, %d weather (KXHIGH/KXLOW)",
+             len(all_events), len(weather_events))
+    if len(all_events) >= 200:
+        log.warning("Kalshi: hit limit=200 on /events; some weather events may be missing (pagination not implemented)")
+
+    for event in weather_events:
+        event_ticker = event.get("event_ticker", "")
+
+        # Skip ignored events
+        if is_event_ignored(conn, event_ticker):
+            ignored += 1
             continue
-        
-        for event in events:
-            event_ticker = event.get("event_ticker", "")
-            
-            # Skip ignored events
-            if is_event_ignored(conn, event_ticker):
-                ignored += 1
-                continue
-            
-            # Determine target type from series
-            target_type = "HIGH" if series == "KXHIGH" else "LOW"
-            
-            # Match to our station
-            market_title = event.get("title", "")
-            station_id = match_kalshi_to_station(event_ticker, market_title)
-            
-            # Get nested markets
-            markets = event.get("markets", [])
-            
-            # Collect all bins to determine tail boundaries
-            all_bins: list[tuple[float, bool]] = []
-            for mkt in markets:
-                try:
-                    ticker = mkt.get("ticker", "")
-                    val, is_tail = parse_ticker_bin(ticker)
-                    all_bins.append((val, is_tail))
-                except Exception:
-                    pass
-            
-            for mkt in markets:
-                try:
-                    ticker = mkt.get("ticker", "")
-                    target_date = parse_ticker_date(ticker)
-                    val, is_tail = parse_ticker_bin(ticker)
-                    bin_lower, bin_upper = compute_bin_boundaries(val, is_tail, all_bins)
-                    
-                    market_row = {
-                        "ticker": ticker,
-                        "event_ticker": event_ticker,
-                        "series_ticker": series,
-                        "station_id": station_id,
-                        "target_date": target_date.isoformat(),
-                        "target_type": target_type,
-                        "bin_lower": bin_lower,
-                        "bin_upper": bin_upper,
-                        "market_title": market_title,
-                        "market_subtitle": mkt.get("subtitle"),
-                        "close_time": mkt.get("close_time"),
-                        "settlement_time": mkt.get("settlement_time"),
-                        "status": mkt.get("status"),
-                        "last_price": mkt.get("last_price"),
-                        "volume": mkt.get("volume"),
-                        "yes_bid": mkt.get("yes_bid"),
-                        "yes_ask": mkt.get("yes_ask"),
-                        "raw": mkt,
-                    }
-                    
-                    upsert_kalshi_market(conn, market_row)
-                    synced += 1
-                    
-                except Exception as e:
-                    log.warning("Failed to process market %s: %s",
-                               mkt.get("ticker", "unknown"), e)
-                    errors += 1
-            
-            # Create alert for unmatched station (once per event)
-            if station_id is None and event_ticker not in alerted_events:
-                if not kalshi_alert_exists(conn, event_ticker):
-                    sample_ticker = markets[0].get("ticker") if markets else event_ticker
-                    create_unknown_station_alert(conn, event_ticker, market_title, sample_ticker)
-                    log.warning("Unknown Kalshi station: %s (%s)", event_ticker, market_title)
-                alerted_events.add(event_ticker)
-                unmatched += 1
-    
+
+        # Determine target type and series prefix from event ticker
+        if event_ticker.startswith("KXHIGH"):
+            target_type = "HIGH"
+            series = "KXHIGH"
+        else:
+            target_type = "LOW"
+            series = "KXLOW"
+
+        # Match to our station
+        market_title = event.get("title", "")
+        station_id = match_kalshi_to_station(event_ticker, market_title)
+
+        # Get nested markets
+        markets = event.get("markets", [])
+
+        # Collect all bins to determine tail boundaries
+        all_bins: list[tuple[float, bool]] = []
+        for mkt in markets:
+            try:
+                ticker = mkt.get("ticker", "")
+                val, is_tail = parse_ticker_bin(ticker)
+                all_bins.append((val, is_tail))
+            except Exception:
+                pass
+
+        for mkt in markets:
+            try:
+                ticker = mkt.get("ticker", "")
+                target_date = parse_ticker_date(ticker)
+                val, is_tail = parse_ticker_bin(ticker)
+                bin_lower, bin_upper = compute_bin_boundaries(val, is_tail, all_bins)
+
+                market_row = {
+                    "ticker": ticker,
+                    "event_ticker": event_ticker,
+                    "series_ticker": series,
+                    "station_id": station_id,
+                    "target_date": target_date.isoformat(),
+                    "target_type": target_type,
+                    "bin_lower": bin_lower,
+                    "bin_upper": bin_upper,
+                    "market_title": market_title,
+                    "market_subtitle": mkt.get("subtitle"),
+                    "close_time": mkt.get("close_time"),
+                    "settlement_time": mkt.get("settlement_time"),
+                    "status": mkt.get("status"),
+                    "last_price": mkt.get("last_price"),
+                    "volume": mkt.get("volume"),
+                    "yes_bid": mkt.get("yes_bid"),
+                    "yes_ask": mkt.get("yes_ask"),
+                    "raw": mkt,
+                }
+
+                upsert_kalshi_market(conn, market_row)
+                synced += 1
+
+            except Exception as e:
+                log.warning("Failed to process market %s: %s",
+                           mkt.get("ticker", "unknown"), e)
+                errors += 1
+
+        # Create alert for unmatched station (once per event)
+        if station_id is None and event_ticker not in alerted_events:
+            if not kalshi_alert_exists(conn, event_ticker):
+                sample_ticker = markets[0].get("ticker") if markets else event_ticker
+                create_unknown_station_alert(conn, event_ticker, market_title, sample_ticker)
+                log.warning("Unknown Kalshi station: %s (%s)", event_ticker, market_title)
+            alerted_events.add(event_ticker)
+            unmatched += 1
+
     conn.commit()
     log.info("Kalshi sync complete: %d synced, %d unmatched, %d ignored, %d errors",
              synced, unmatched, ignored, errors)
