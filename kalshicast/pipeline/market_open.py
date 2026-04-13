@@ -49,24 +49,24 @@ def main() -> None:
     total_bets = 0
     total_orders = 0
 
-    # ─────────────────────────────────────────────────────────────────
-    # Step 0: Sync Kalshi markets (get real tickers)
-    # ─────────────────────────────────────────────────────────────────
-    log.info("Step 0: Syncing Kalshi markets")
-    try:
-        from kalshicast.collection.kalshi_markets import sync_kalshi_markets
-        from kalshicast.execution.kalshi_api import KalshiClient
-        
-        client = KalshiClient()
-        sync_result = sync_kalshi_markets(conn, client)
-        log.info("Step 0 OK: %d markets synced, %d unmatched, %d ignored",
-                 sync_result.synced, sync_result.unmatched, sync_result.ignored)
-    except Exception as e:
-        log.error("Step 0 ERROR: Market sync failed: %s", e)
-        # Continue anyway - we may have cached data from previous run
-
     conn = get_conn()
     try:
+        # ─────────────────────────────────────────────────────────────
+        # Step 0: Sync Kalshi markets (get real tickers)
+        # ─────────────────────────────────────────────────────────────
+        log.info("Step 0: Syncing Kalshi markets")
+        try:
+            from kalshicast.collection.kalshi_markets import sync_kalshi_markets
+            from kalshicast.execution.kalshi_api import KalshiClient
+
+            client = KalshiClient()
+            sync_result = sync_kalshi_markets(conn, client)
+            log.info("Step 0 OK: %d markets synced, %d unmatched, %d ignored",
+                     sync_result.synced, sync_result.unmatched, sync_result.ignored)
+        except Exception as e:
+            log.error("Step 0 ERROR: Market sync failed: %s", e)
+            # Continue anyway - we may have cached data from previous run
+
         # Step 3: fetch_bankroll and init client
         bankroll = 1000.0  # Paper mode default
         client = None
