@@ -156,15 +156,6 @@ class KalshiClient:
 
     # ── Markets ───────────────────────────────────────────────────────
 
-    def get_events(self, *, status: str = "open", limit: int = 200) -> list[dict]:
-        """GET /events with nested markets."""
-        data = self._request("GET", "/events", params={
-            "status": status,
-            "limit": limit,
-            "with_nested_markets": "true",
-        })
-        return data.get("events", [])
-
     def get_orderbook(self, ticker: str, *, depth: int | None = None) -> dict:
         """GET /markets/{ticker}/orderbook."""
         if depth is None:
