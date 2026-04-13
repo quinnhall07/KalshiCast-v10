@@ -1315,3 +1315,142 @@ def insert_system_alert(conn: Any, alert: dict) -> None:
             "details": json.dumps(alert.get("details")) if alert.get("details") else None,
         })
 
+# ─────────────────────────────────────────────────────────────────────
+# Kalshi Market Sync
+# ─────────────────────────────────────────────────────────────────────
+
+def upsert_kalshi_market(conn: Any, market: dict) -> None:
+    """Upsert a single Kalshi market row."""
+    import json
+    with conn.cursor() as cur:
+        cur.execute("""
+            MERGE /*+ NO_PARALLEL(tgt) */ INTO KALSHI_MARKETS tgt
+            USING (SELECT :ticker AS ticker FROM DUAL) src
+            ON (tgt.TICKER = src.ticker)
+            WHEN MATCHED THEN UPDATE SET
+                EVENT_TICKER = :event_ticker,
+                SERIES_TICKER = :series_ticker,
+                STATION_ID = :station_id,
+                TARGET_DATE = TO_DATE(:target_date, 'YYYY-MM-DD'),
+                TARGET_TYPE = :target_type,
+                BIN_LOWER = :bin_lower,
+                BIN_UPPER = :bin_upper,
+                MARKET_TITLE = :market_title,
+                MARKET_SUBTITLE = :market_subtitle,
+                CLOSE_TIME = :close_time,
+                SETTLEMENT_TIME = :settlement_time,
+                STATUS = :status,
+                LAST_PRICE = :last_price,
+                VOLUME = :volume,
+                YES_BID = :yes_bid,
+                YES_ASK = :yes_ask,
+                SYNCED_AT = SYSTIMESTAMP,
+                RAW_JSON = :raw_json
+            WHEN NOT MATCHED THEN INSERT (
+                TICKER, EVENT_TICKER, SERIES_TICKER, STATION_ID,
+                TARGET_DATE, TARGET_TYPE, BIN_LOWER, BIN_UPPER,
+                MARKET_TITLE, MARKET_SUBTITLE, CLOSE_TIME, SETTLEMENT_TIME,
+                STATUS, LAST_PRICE, VOLUME, YES_BID, YES_ASK, RAW_JSON
+            ) VALUES (
+                :ticker, :event_ticker, :series_ticker, :station_id,
+                TO_DATE(:target_date, 'YYYY-MM-DD'), :target_type, :bin_lower, :bin_upper,
+                :market_title, :market_subtitle, :close_time, :settlement_time,
+                :status, :last_price, :volume, :yes_bid, :yes_ask, :raw_json
+            )
+        """, {
+            "ticker": market["ticker"],
+            "event_ticker": market["event_ticker"],
+            "series_ticker": market["series_ticker"],
+            "station_id": market.get("station_id"),
+            "target_date": market["target_date"],
+            "target_type": market["target_type"],
+            "bin_lower": market.get("bin_lower"),
+            "bin_upper": market.get("bin_upper"),
+            "market_title": market.get("market_title"),
+            "market_subtitle": market.get("market_subtitle"),
+            "close_time": market.get("close_time"),
+            "settlement_time": market.get("settlement_time"),
+            "status": market.get("status"),
+            "last_price": market.get("last_price"),
+            "volume": market.get("volume"),
+            "yes_bid": market.get("yes_bid"),
+            "yes_ask": market.get("yes_ask"),
+            "raw_json": json.dumps(market.get("raw")) if market.get("raw") else None,
+        })
+
+
+def get_kalshi_bins(conn: Any, station_id: str, target_date: str,
+                    target_type: str) -> list[dict]:
+    """Get real Kalshi bins for a station/date/type combination.
+    
+    Returns list of dicts with ticker, bin_lower, bin_upper, and market prices.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT TICKER, BIN_LOWER, BIN_UPPER, LAST_PRICE, YES_BID, YES_ASK
+            FROM KALSHI_MARKETS
+            WHERE STATION_ID = :sid
+              AND TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD')
+              AND TARGET_TYPE = :tt
+              AND STATUS IN ('open', 'active')
+            ORDER BY BIN_LOWER NULLS FIRST
+        """, {"sid": station_id, "td": target_date, "tt": target_type})
+        
+        return [
+            {
+                "ticker": row[0],
+                "bin_lower": float(row[1]) if row[1] is not None else float('-inf'),
+                "bin_upper": float(row[2]) if row[2] is not None else float('inf'),
+                "last_price": float(row[3]) if row[3] else None,
+                "yes_bid": float(row[4]) if row[4] else None,
+                "yes_ask": float(row[5]) if row[5] else None,
+            }
+            for row in cur
+        ]
+
+
+def is_event_ignored(conn: Any, event_ticker: str) -> bool:
+    """Check if an event ticker is in the ignored list."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM KALSHI_IGNORED_EVENTS
+            WHERE EVENT_TICKER = :et
+        """, {"et": event_ticker})
+        return cur.fetchone() is not None
+
+
+def kalshi_alert_exists(conn: Any, event_ticker: str) -> bool:
+    """Check if an unknown station alert already exists for this event."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT 1 FROM SYSTEM_ALERTS
+            WHERE ALERT_TYPE = 'UNKNOWN_KALSHI_STATION'
+              AND DETAILS LIKE :ref_pattern
+              AND STATUS = 'OPEN'
+        """, {"ref_pattern": f'%{event_ticker}%'})
+        return cur.fetchone() is not None
+
+
+def create_unknown_station_alert(conn: Any, event_ticker: str,
+                                  market_title: str, sample_ticker: str) -> None:
+    """Create an alert for an unmatched Kalshi station."""
+    import json
+    import uuid
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO SYSTEM_ALERTS (
+                ALERT_ID, ALERT_TYPE, SEVERITY, TITLE, DETAILS, STATUS, CREATED_AT
+            ) VALUES (
+                :aid, 'UNKNOWN_KALSHI_STATION', 'WARNING',
+                :title, :details, 'OPEN', SYSTIMESTAMP
+            )
+        """, {
+            "aid": str(uuid.uuid4()),
+            "title": f"Unmatched Kalshi market: {event_ticker}",
+            "details": json.dumps({
+                "event_ticker": event_ticker,
+                "market_title": market_title,
+                "sample_ticker": sample_ticker,
+                "action_required": "Add station to stations.py or add to KALSHI_IGNORED_EVENTS"
+            }),
+        })

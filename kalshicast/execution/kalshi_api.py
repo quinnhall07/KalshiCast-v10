@@ -47,6 +47,29 @@ class KalshiClient:
         self._session = requests.Session()
         self._session.headers["Content-Type"] = "application/json"
 
+    def get_events(self, *, status: str = "open", series_ticker: str | None = None,
+                   limit: int = 100) -> list[dict]:
+        """GET /events — fetch events with optional filtering.
+        
+        Args:
+            status: Filter by status (open, closed, settled)
+            series_ticker: Filter by series (e.g., KXHIGH, KXLOW)
+            limit: Max results to return
+        
+        Returns:
+            List of event dicts with nested markets
+        """
+        params = {
+            "status": status,
+            "limit": limit,
+            "with_nested_markets": "true",
+        }
+        if series_ticker:
+            params["series_ticker"] = series_ticker
+        
+        data = self._request("GET", "/events", params=params)
+        return data.get("events", [])
+
     # ── Authentication ───────────────────────────────────────────────
 
     def _sign_headers(self, method: str, path: str) -> dict[str, str]:

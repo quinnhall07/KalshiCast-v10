@@ -60,6 +60,7 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KMDW",
         "cli_site": "MDW",
+        "kalshi_city": "CHI",  # Kalshi uses CHI for Chicago
         "name": "Chicago Midway Airport",
         "state": "IL",
         "city": "Chicago",
@@ -73,6 +74,7 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KLAX",
         "cli_site": "LAX",
+        "kalshi_city": "LA",  # Kalshi uses LA for Los Angeles
         "name": "Los Angeles International Airport",
         "state": "CA",
         "city": "Los Angeles",
@@ -272,3 +274,25 @@ def get_stations(*, active_only: bool = True) -> list[dict[str, Any]]:
     if active_only:
         return [s for s in STATIONS if s.get("is_active")]
     return list(STATIONS)
+
+def get_kalshi_city(station_id: str) -> str:
+    """Get the Kalshi city code for a station.
+    
+    Returns kalshi_city if set, otherwise cli_site.
+    """
+    station = get_station(station_id)
+    return station.get("kalshi_city", station["cli_site"])
+
+
+def get_station_by_kalshi_city(kalshi_city: str) -> dict[str, Any] | None:
+    """Find station by Kalshi city code.
+    
+    Checks kalshi_city first, then cli_site.
+    Returns None if no match.
+    """
+    for s in STATIONS:
+        if s.get("kalshi_city") == kalshi_city:
+            return s
+        if s["cli_site"] == kalshi_city:
+            return s
+    return None

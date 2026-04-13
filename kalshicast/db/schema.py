@@ -532,6 +532,50 @@ ALL_DDL: list[str] = [
         VETO_REASON     VARCHAR2(200),
         RECORDED_AT     TIMESTAMP(6) DEFAULT SYSTIMESTAMP
     )""",
+
+    # ─────────────────────────────────────────────────────────────────
+    # Kalshi Market Sync
+    # ─────────────────────────────────────────────────────────────────
+    """
+    CREATE TABLE KALSHI_MARKETS (
+        TICKER              VARCHAR2(64)   PRIMARY KEY,
+        EVENT_TICKER        VARCHAR2(32)   NOT NULL,
+        SERIES_TICKER       VARCHAR2(16)   NOT NULL,
+        STATION_ID          VARCHAR2(8),
+        TARGET_DATE         DATE           NOT NULL,
+        TARGET_TYPE         VARCHAR2(8)    NOT NULL,
+        BIN_LOWER           NUMBER(5,1),
+        BIN_UPPER           NUMBER(5,1),
+        MARKET_TITLE        VARCHAR2(256),
+        MARKET_SUBTITLE     VARCHAR2(256),
+        CLOSE_TIME          TIMESTAMP WITH TIME ZONE,
+        SETTLEMENT_TIME     TIMESTAMP WITH TIME ZONE,
+        STATUS              VARCHAR2(32),
+        LAST_PRICE          NUMBER(5,4),
+        VOLUME              NUMBER(12),
+        YES_BID             NUMBER(5,4),
+        YES_ASK             NUMBER(5,4),
+        SYNCED_AT           TIMESTAMP DEFAULT SYSTIMESTAMP,
+        RAW_JSON            CLOB
+    )
+    """,
+    """
+    CREATE INDEX IDX_KM_STATION_DATE ON KALSHI_MARKETS(STATION_ID, TARGET_DATE)
+    """,
+    """
+    CREATE INDEX IDX_KM_EVENT ON KALSHI_MARKETS(EVENT_TICKER)
+    """,
+    """
+    CREATE INDEX IDX_KM_SYNCED ON KALSHI_MARKETS(SYNCED_AT)
+    """,
+    """
+    CREATE TABLE KALSHI_IGNORED_EVENTS (
+        EVENT_TICKER    VARCHAR2(32) PRIMARY KEY,
+        REASON          VARCHAR2(256),
+        IGNORED_AT      TIMESTAMP DEFAULT SYSTIMESTAMP,
+        IGNORED_BY      VARCHAR2(64)
+    )
+    """,
 ]
 
 ALL_INDEXES: list[str] = [

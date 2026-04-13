@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import math
 from typing import Any
-
+from kalshicast.db.operations import get_kalshi_bins
 from kalshicast.config.params_bootstrap import get_param_float, get_param_int
 
 log = logging.getLogger(__name__)
@@ -223,7 +223,12 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
         # Generate bins
         # Look up Kalshi city code from station config
         _cli_site = station_cli_map.get(station_id)
-        bins = generate_station_bins(station_id, target_date, mu, target_type, cli_site=_cli_site)
+        bins = get_kalshi_bins(conn, station_id, target_date, target_type)
+
+        if not bins:
+            log.debug("No Kalshi markets for %s/%s/%s - skipping",
+                    station_id, target_date, target_type)
+            continue
 
         # Compute P(win) for each bin
         probs = [compute_p_win(b["bin_lower"], b["bin_upper"], xi_s, omega_s, alpha_s) for b in bins]
@@ -244,7 +249,7 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
             p_win = bp["p_win"]
 
             sb_rows.append({
-                "ticker": b["ticker"],
+                "ticker": bin_data["ticker"],  # Real Kalshi ticker!
                 "station_id": station_id,
                 "target_date": target_date,
                 "target_type": target_type,
