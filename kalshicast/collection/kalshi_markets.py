@@ -91,14 +91,18 @@ def compute_bin_boundaries(bin_value: float, is_tail: bool,
 
 def extract_city_code(event_ticker: str) -> str:
     """Extract city code from event ticker.
-    
-    KXHIGHNYC → NYC
-    KXLOWCHI → CHI
+
+    KXHIGHNYC-26APR13 → NYC
+    KXLOWCHI-26APR13 → CHI
+    KXHIGHNYC → NYC (bare series form)
     """
-    if event_ticker.startswith("KXHIGH"):
-        return event_ticker[6:]
-    elif event_ticker.startswith("KXLOW"):
-        return event_ticker[5:]
+    # Event tickers have the form "{series}-{date}", e.g. "KXHIGHNYC-26APR13".
+    # Strip the date suffix first so [6:] / [5:] yield just the city code.
+    series = event_ticker.split("-", 1)[0]
+    if series.startswith("KXHIGH"):
+        return series[6:]
+    elif series.startswith("KXLOW"):
+        return series[5:]
     else:
         raise ValueError(f"Unknown event ticker format: {event_ticker}")
 
@@ -175,41 +179,57 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
     # Track which events we've already alerted on this run
     alerted_events: set[str] = set()
 
-    # Fetch all open events in one call and filter client-side.
-    # Kalshi's series_ticker is per-city (e.g. KXHIGHNYC, KXLOWMIA), so a
-    # filter of series_ticker="KXHIGH" returns nothing. Fetching unfiltered
-    # and prefix-matching event_ticker is robust to the exact series naming.
+    # Fetch weather events per-series. Kalshi's series_ticker is per-city
+    # (e.g. KXHIGHNYC, KXLOWCHI), so we iterate over our stations and query
+    # each city's HIGH and LOW series directly. Querying /events unfiltered
+    # returns a firehose of non-weather markets (elections, entertainment,
+    # Mars colonization, etc.) and hits the limit=200 cap long before
+    # reaching any weather events — leaving KALSHI_MARKETS empty.
     log.info("Kalshi: base_url=%s", getattr(client, "base_url", "?"))
-    try:
-        all_events = client.get_events(status="open", limit=200)
-    except Exception as e:
-        log.error("Failed to fetch Kalshi events: %s", e)
-        return SyncResult(synced=0, unmatched=0, ignored=0, errors=1)
+    from kalshicast.config.stations import get_stations
 
-    weather_events = [
-        e for e in all_events
-        if e.get("event_ticker", "").startswith(("KXHIGH", "KXLOW"))
-    ]
-    log.info("Kalshi: fetched %d open events, %d weather (KXHIGH/KXLOW)",
-             len(all_events), len(weather_events))
+    stations = get_stations(active_only=True)
+    weather_events: list[dict] = []
+    per_series_counts: list[tuple[str, int]] = []
 
-    # Diagnostic: if we got events but none matched our weather filter, dump
-    # the distribution so we can see what Kalshi is actually returning.
-    if all_events and not weather_events:
-        from collections import Counter
-        series_counts = Counter(e.get("series_ticker", "<none>") for e in all_events)
-        log.warning("Kalshi: no KXHIGH/KXLOW events found. Top series_ticker values (count):")
-        for st, n in series_counts.most_common(20):
-            log.warning("    %-24s %d", st, n)
-        log.warning("Kalshi: sample event_tickers (first 10):")
-        for e in all_events[:10]:
-            log.warning("    series=%-20s event=%-30s title=%s",
-                        e.get("series_ticker", "?"),
-                        e.get("event_ticker", "?"),
-                        (e.get("title") or "")[:60])
+    for station in stations:
+        city_code = station.get("kalshi_city") or station["cli_site"]
+        for series_prefix in ("KXHIGH", "KXLOW"):
+            series_ticker = f"{series_prefix}{city_code}"
+            try:
+                events = client.get_events(
+                    status="open", series_ticker=series_ticker, limit=200,
+                )
+            except Exception as e:
+                log.warning("Kalshi: fetch %s failed: %s", series_ticker, e)
+                continue
 
-    if len(all_events) >= 200:
-        log.warning("Kalshi: hit limit=200 on /events; some weather events may be missing (pagination not implemented)")
+            # Defensive filter: only keep events whose event_ticker actually
+            # belongs to this series. Guards against the API silently
+            # ignoring the filter and returning unrelated events.
+            events = [
+                e for e in events
+                if e.get("event_ticker", "").startswith(series_ticker + "-")
+                or e.get("series_ticker") == series_ticker
+            ]
+            per_series_counts.append((series_ticker, len(events)))
+            weather_events.extend(events)
+
+    total_fetched = sum(n for _, n in per_series_counts)
+    nonzero_series = sum(1 for _, n in per_series_counts if n > 0)
+    log.info(
+        "Kalshi: fetched %d weather events from %d/%d station series",
+        total_fetched, nonzero_series, len(per_series_counts),
+    )
+
+    if total_fetched == 0:
+        log.warning(
+            "Kalshi: no weather events returned for any of %d station series. "
+            "Verify that KXHIGH/KXLOW series exist for these cities.",
+            len(per_series_counts),
+        )
+        for series_ticker, _ in per_series_counts[:20]:
+            log.warning("    queried %s -> 0 events", series_ticker)
 
     for event in weather_events:
         event_ticker = event.get("event_ticker", "")
