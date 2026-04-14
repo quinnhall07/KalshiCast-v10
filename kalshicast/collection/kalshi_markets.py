@@ -10,6 +10,7 @@ This module handles:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Any
@@ -23,37 +24,60 @@ log = logging.getLogger(__name__)
 
 def parse_ticker_date(ticker: str) -> date:
     """Extract date from Kalshi ticker.
-    
+
     Format: KXHIGHNYC-26APR13-B80 → 2026-04-13
     Date portion is YYMMMDD (e.g., 26APR13)
     """
     parts = ticker.split("-")
     if len(parts) < 2:
         raise ValueError(f"Invalid ticker format: {ticker}")
-    
+
     date_str = parts[1]  # "26APR13"
     return datetime.strptime(date_str, "%y%b%d").date()
 
 
+def parse_iso_utc(ts: Any) -> datetime | None:
+    """Parse a Kalshi ISO-8601 timestamp into a Python datetime.
+
+    Kalshi returns timestamps like "2026-04-15T19:00:00Z". Oracle's default
+    NLS_TIMESTAMP_TZ_FORMAT does not match this string, so passing the raw
+    string to a TIMESTAMP WITH TIME ZONE column triggers implicit-conversion
+    errors (ORA-01843 / ORA-01861). Parsing to a datetime lets oracledb bind
+    it as a native TIMESTAMP.
+    """
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        # Python <3.11 rejects the trailing 'Z'; normalize it first.
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+
+
 def parse_ticker_bin(ticker: str) -> tuple[float, bool]:
     """Extract bin value from Kalshi ticker.
-    
-    Interior bins: B80 → (80, False)
-    Tail bins: T90 → (90, True)
-    
+
+    Interior bins: B80 → (80.0, False), B77.5 → (77.5, False)
+    Tail bins: T90 → (90.0, True)
+
+    Kalshi uses half-degree bins (e.g. B77.5) for some cities, so parse
+    as float rather than int.
+
     Returns (value, is_tail).
     """
     parts = ticker.split("-")
     if len(parts) < 3:
         raise ValueError(f"Invalid ticker format: {ticker}")
-    
-    bin_part = parts[2]  # "B80" or "T90"
-    
+
+    bin_part = parts[2]  # "B80" or "T90" or "B77.5"
+
     if bin_part.startswith("B"):
-        center = int(bin_part[1:])
+        center = float(bin_part[1:])
         return (center, False)
     elif bin_part.startswith("T"):
-        threshold = int(bin_part[1:])
+        threshold = float(bin_part[1:])
         return (threshold, True)
     else:
         raise ValueError(f"Unknown bin format: {bin_part}")
@@ -192,9 +216,18 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
     weather_events: list[dict] = []
     per_series_counts: list[tuple[str, int]] = []
 
+    # Kalshi applies per-second rate limiting; 40 back-to-back calls triggers
+    # 429s. Sleep a short interval between calls to stay under the limit.
+    rate_limit_sleep = 0.15  # ~6-7 req/sec, well under Kalshi's quota
+
+    first_call = True
     for station in stations:
         city_code = station.get("kalshi_city") or station["cli_site"]
         for series_prefix in ("KXHIGH", "KXLOW"):
+            if not first_call:
+                time.sleep(rate_limit_sleep)
+            first_call = False
+
             series_ticker = f"{series_prefix}{city_code}"
             try:
                 events = client.get_events(
@@ -276,14 +309,16 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
                     "event_ticker": event_ticker,
                     "series_ticker": series,
                     "station_id": station_id,
-                    "target_date": target_date.isoformat(),
+                    # Pass date object directly; oracledb binds it as Oracle
+                    # DATE natively, avoiding any TO_DATE/NLS conversion issues.
+                    "target_date": target_date,
                     "target_type": target_type,
                     "bin_lower": bin_lower,
                     "bin_upper": bin_upper,
                     "market_title": market_title,
                     "market_subtitle": mkt.get("subtitle"),
-                    "close_time": mkt.get("close_time"),
-                    "settlement_time": mkt.get("settlement_time"),
+                    "close_time": parse_iso_utc(mkt.get("close_time")),
+                    "settlement_time": parse_iso_utc(mkt.get("settlement_time")),
                     "status": mkt.get("status"),
                     "last_price": mkt.get("last_price"),
                     "volume": mkt.get("volume"),
