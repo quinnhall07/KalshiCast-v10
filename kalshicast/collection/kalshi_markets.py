@@ -179,6 +179,7 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
     # Kalshi's series_ticker is per-city (e.g. KXHIGHNYC, KXLOWMIA), so a
     # filter of series_ticker="KXHIGH" returns nothing. Fetching unfiltered
     # and prefix-matching event_ticker is robust to the exact series naming.
+    log.info("Kalshi: base_url=%s", getattr(client, "base_url", "?"))
     try:
         all_events = client.get_events(status="open", limit=200)
     except Exception as e:
@@ -191,6 +192,22 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
     ]
     log.info("Kalshi: fetched %d open events, %d weather (KXHIGH/KXLOW)",
              len(all_events), len(weather_events))
+
+    # Diagnostic: if we got events but none matched our weather filter, dump
+    # the distribution so we can see what Kalshi is actually returning.
+    if all_events and not weather_events:
+        from collections import Counter
+        series_counts = Counter(e.get("series_ticker", "<none>") for e in all_events)
+        log.warning("Kalshi: no KXHIGH/KXLOW events found. Top series_ticker values (count):")
+        for st, n in series_counts.most_common(20):
+            log.warning("    %-24s %d", st, n)
+        log.warning("Kalshi: sample event_tickers (first 10):")
+        for e in all_events[:10]:
+            log.warning("    series=%-20s event=%-30s title=%s",
+                        e.get("series_ticker", "?"),
+                        e.get("event_ticker", "?"),
+                        (e.get("title") or "")[:60])
+
     if len(all_events) >= 200:
         log.warning("Kalshi: hit limit=200 on /events; some weather events may be missing (pagination not implemented)")
 
