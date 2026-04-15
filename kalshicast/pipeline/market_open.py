@@ -179,7 +179,7 @@ def main() -> None:
                     conn, pipeline_run_id,
                     bankroll=1000.0,
                     target_dates=target_dates,
-                    paper_mode=False,
+                    paper_mode=True,
                 )
                 from kalshicast.pipeline.paper_sim import create_paper_positions
                 n_paper = create_paper_positions(conn, pipeline_run_id)
@@ -443,10 +443,15 @@ def _step9_evaluate_gates_ibe(
                 SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
                        sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
                        sb.TOP_MODEL_ID,
-                       sb.P_WIN AS C_VWAP_COMPUTED, 100 AS AVAILABLE_DEPTH
+                       COALESCE(km.YES_ASK, km.LAST_PRICE, km.YES_BID) / 100.0
+                           AS C_VWAP_COMPUTED,
+                       100 AS AVAILABLE_DEPTH
                 FROM SHADOW_BOOK sb
+                LEFT JOIN KALSHI_MARKETS km ON km.TICKER = sb.TICKER
                 WHERE sb.PIPELINE_RUN_ID = :run_id
                   AND sb.P_WIN IS NOT NULL
+                  AND COALESCE(km.YES_ASK, km.LAST_PRICE, km.YES_BID) IS NOT NULL
+                  AND COALESCE(km.YES_ASK, km.LAST_PRICE, km.YES_BID) > 0
             """, {"run_id": pipeline_run_id})
         else:
             cur.execute("""
