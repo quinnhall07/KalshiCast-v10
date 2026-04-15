@@ -22,10 +22,12 @@ def get_model_path(station_id, target_type, model_ext):
 # --- FEATURE SETS ---
 # We keep these here so tune.py and train.py are always in sync
 FEATURES = {
-    'HIGH': ['forecast_high', 'day_of_year', 'forecast_precip', 'forecast_wind',
+    'HIGH': ['forecast_high', 'forecast_low', 'forecast_diurnal_range',
+             'day_sin', 'day_cos', 'forecast_precip', 'forecast_wind',
              'forecast_radiation', 'forecast_evap', 'lag_high_1d', 'lag_high_2d',
              'roll_high_7d_mean', 'roll_high_14d_mean', 'roll_high_7d_std'],
-    'LOW':  ['forecast_low', 'day_of_year', 'forecast_precip', 'forecast_wind',
+    'LOW':  ['forecast_low', 'forecast_high', 'forecast_diurnal_range',
+             'day_sin', 'day_cos', 'forecast_precip', 'forecast_wind',
              'forecast_radiation', 'forecast_evap', 'lag_low_1d', 'lag_low_2d',
              'roll_low_7d_mean', 'roll_low_14d_mean', 'roll_low_7d_std']
 }

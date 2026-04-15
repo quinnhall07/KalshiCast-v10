@@ -195,7 +195,7 @@ STATIONS: list[dict[str, Any]] = [
         "name": "Phoenix Sky Harbor International Airport",
         "state": "AZ",
         "city": "Phoenix",
-        "timezone": "US/Mountain",
+        "timezone": "America/Phoenix",  # Arizona does NOT observe DST
         "lat": 33.427799,
         "lon": -112.003465,
         "elevation_ft": 1115,

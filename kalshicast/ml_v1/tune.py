@@ -4,10 +4,12 @@ from __future__ import annotations
 import os
 import json
 import logging
+import numpy as np
 import optuna
 import xgboost as xgb
 import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error
+from sklearn.model_selection import TimeSeriesSplit
 from concurrent.futures import ProcessPoolExecutor
 
 from kalshicast.ml_v1.config import get_model_path, FEATURES, CURRENT_VERSION
@@ -17,7 +19,14 @@ from kalshicast.ml_v1.stations import get_stations
 log = logging.getLogger(__name__)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-def tune_xgb(X_train, y_train, X_valid, y_valid):
+def tune_xgb(X, y, n_splits=3):
+    """Tune XGBoost with TimeSeriesSplit CV for robust hyperparameters.
+
+    Using 3-fold expanding-window CV instead of a single split prevents
+    hyperparameters from overfitting to one seasonal validation window.
+    """
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
     def objective(trial):
         params = {
             'max_depth': trial.suggest_int('max_depth', 3, 10),
@@ -26,27 +35,37 @@ def tune_xgb(X_train, y_train, X_valid, y_valid):
             'subsample': trial.suggest_float('subsample', 0.6, 1.0),
             'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
             'gamma': trial.suggest_float('gamma', 0.0, 5.0),
+            'reg_alpha': trial.suggest_float('reg_alpha', 1e-8, 10.0, log=True),
+            'reg_lambda': trial.suggest_float('reg_lambda', 1e-8, 10.0, log=True),
             'early_stopping_rounds': 50,
             'eval_metric': 'mae',
             'random_state': 42,
             'n_jobs': 2
         }
-        model = xgb.XGBRegressor(**params)
-        model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
-        best_iter = getattr(model, 'best_iteration', None)
-        # best_iteration is None when early stopping never triggers (e.g. all
-        # n_estimators rounds complete without improvement for patience window)
-        n_est = (best_iter + 1) if best_iter is not None else params['n_estimators']
-        trial.set_user_attr('n_estimators', n_est)
-        return mean_absolute_error(y_valid, model.predict(X_valid))
+        scores = []
+        best_iters = []
+        for train_idx, val_idx in tscv.split(X):
+            model = xgb.XGBRegressor(**params)
+            model.fit(X.iloc[train_idx], y.iloc[train_idx],
+                      eval_set=[(X.iloc[val_idx], y.iloc[val_idx])], verbose=False)
+            pred = model.predict(X.iloc[val_idx])
+            scores.append(mean_absolute_error(y.iloc[val_idx], pred))
+            b_iter = getattr(model, 'best_iteration', None)
+            best_iters.append((b_iter + 1) if b_iter is not None else params['n_estimators'])
+        trial.set_user_attr('n_estimators', int(np.mean(best_iters)))
+        return np.mean(scores)
 
-    study = optuna.create_study(direction='minimize')
+    sampler = optuna.samplers.TPESampler(seed=42)
+    study = optuna.create_study(direction='minimize', sampler=sampler)
     study.optimize(objective, n_trials=50)
     best = study.best_params.copy()
     best['n_estimators'] = study.best_trial.user_attrs['n_estimators']
     return best
 
-def tune_lgbm(X_train, y_train, X_valid, y_valid):
+def tune_lgbm(X, y, n_splits=3):
+    """Tune LightGBM with TimeSeriesSplit CV for robust hyperparameters."""
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+
     def objective(trial):
         params = {
             'num_leaves': trial.suggest_int('num_leaves', 20, 150),
@@ -56,17 +75,27 @@ def tune_lgbm(X_train, y_train, X_valid, y_valid):
             'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 1.0),
             'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 1.0),
             'bagging_freq': trial.suggest_int('bagging_freq', 1, 7),
+            'lambda_l1': trial.suggest_float('lambda_l1', 1e-8, 10.0, log=True),
+            'lambda_l2': trial.suggest_float('lambda_l2', 1e-8, 10.0, log=True),
             'random_state': 42,
             'n_jobs': 2,
             'verbosity': -1
         }
-        model = lgb.LGBMRegressor(**params)
-        model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)],
-                  callbacks=[lgb.early_stopping(50), lgb.log_evaluation(period=0)])
-        trial.set_user_attr('n_estimators', model.best_iteration_ + 1)
-        return mean_absolute_error(y_valid, model.predict(X_valid))
+        scores = []
+        best_iters = []
+        for train_idx, val_idx in tscv.split(X):
+            model = lgb.LGBMRegressor(**params)
+            model.fit(X.iloc[train_idx], y.iloc[train_idx],
+                      eval_set=[(X.iloc[val_idx], y.iloc[val_idx])],
+                      callbacks=[lgb.early_stopping(50), lgb.log_evaluation(period=0)])
+            pred = model.predict(X.iloc[val_idx])
+            scores.append(mean_absolute_error(y.iloc[val_idx], pred))
+            best_iters.append(model.best_iteration_ + 1)
+        trial.set_user_attr('n_estimators', int(np.mean(best_iters)))
+        return np.mean(scores)
 
-    study = optuna.create_study(direction='minimize')
+    sampler = optuna.samplers.TPESampler(seed=42)
+    study = optuna.create_study(direction='minimize', sampler=sampler)
     study.optimize(objective, n_trials=50)
     best = study.best_params.copy()
     best['n_estimators'] = study.best_trial.user_attrs['n_estimators']
@@ -79,17 +108,16 @@ def run_tuning(station_id, lat, lon):
 
     df = df.sort_values('time')
     n = len(df)
-    tune_end = int(n * 0.6)
-    valid_end = int(n * 0.8)
-    train = df.iloc[:tune_end]
-    valid = df.iloc[tune_end:valid_end]
+    # Hold out final 20% as test — tuning never sees this data.
+    # TimeSeriesSplit creates expanding windows within the 80% tuning data.
+    tuning_data = df.iloc[:int(n * 0.8)]
 
     for t_type in ['HIGH', 'LOW']:
         feat = FEATURES[t_type]
         target = f'target_error_{t_type.lower()}'
 
-        best_xgb = tune_xgb(train[feat], train[target], valid[feat], valid[target])
-        best_lgbm = tune_lgbm(train[feat], train[target], valid[feat], valid[target])
+        best_xgb = tune_xgb(tuning_data[feat], tuning_data[target])
+        best_lgbm = tune_lgbm(tuning_data[feat], tuning_data[target])
 
         # Persist complete params including fixed settings
         best_xgb['random_state'] = 42
