@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import xgboost, lightgbm, optuna, sklearn; print\\(''All ML deps OK''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(gh pr:*)"
+    ]
+  }
+}
