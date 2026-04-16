@@ -2,16 +2,18 @@
 from __future__ import annotations
 
 import os
+import numpy as np
 import json
 import logging
 import xgboost as xgb
 import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error
 from concurrent.futures import ProcessPoolExecutor
+from scipy.optimize import minimize
 
 from kalshicast.ml_v1.config import get_model_path, FEATURES, CURRENT_VERSION
 from kalshicast.ml_v1.dataset import fetch_bootstrap_data
-from kalshicast.ml_v1.stations import get_stations
+from kalshicast.config.stations import get_stations
 
 log = logging.getLogger(__name__)
 
@@ -49,65 +51,76 @@ def train_station_models(station_id, lat, lon):
         feat = FEATURES[t_type]
         target = f'target_error_{t_type.lower()}'
         
-        # --- Phase 1: Train on 60%, early stop on VAL (60-80%) ---
-        # Early stopping watches the validation set to find when boosting
-        # should stop. The test set is NEVER exposed to the training loop.
+        # --- Phase 1: Train on 0-60%, Evaluate Blend on 60-80% ---
+        # We leverage the immutable optimal n_estimators from params.json 
+        # (calculated by walk-forward CV in tune.py) rather than running early
+        # stopping on a biased seasonal validation holdout.
         
         xgb_params = params['xgb'].copy()
-        xgb_params['n_estimators'] = 5000  # High ceiling; early stopping finds the real optimum
-        xgb_params['early_stopping_rounds'] = 50
-        xgb_params['eval_metric'] = 'mae'
-        
         m_xgb_val = xgb.XGBRegressor(**xgb_params)
-        m_xgb_val.fit(train[feat], train[target],
-                       eval_set=[(val[feat], val[target])], verbose=False)
-        xgb_best_iter = m_xgb_val.best_iteration + 1  # 0-indexed -> count
+        m_xgb_val.fit(train[feat], train[target])
         
         lgbm_params = params['lgbm'].copy()
-        lgbm_params['n_estimators'] = 5000
-        
         m_lgbm_val = lgb.LGBMRegressor(**lgbm_params)
-        m_lgbm_val.fit(train[feat], train[target],
-                        eval_set=[(val[feat], val[target])],
-                        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(period=0)])
-        lgbm_best_iter = m_lgbm_val.best_iteration_ + 1
+        m_lgbm_val.fit(train[feat], train[target])
         
         # Save Phase 1 models for backtesting (trained on 60%, never saw test)
         m_xgb_val.save_model(xgb_bt_path)
         m_lgbm_val.booster_.save_model(lgbm_bt_path)
         
-        # Report TRUE holdout MAE on test set (never used for any training decision)
+        # Optimize Blend Weight on Validation Set (60-80% chunk)
+        # Rule #6: Calculate blend weight on validation holdout, not test holdout!
+        p_xgb_val = m_xgb_val.predict(val[feat])
+        p_lgbm_val = m_lgbm_val.predict(val[feat])
+        
+        def blend_objective(w):
+            blended = w[0] * p_xgb_val + (1 - w[0]) * p_lgbm_val
+            
+            # 1. Bracket Penalty (We want to MINIMIZE the number of misses outside of 1.5F)
+            errors = np.abs(val[target].values - blended)
+            # Heavy penalty for errors > 1.5F, light penalty for small errors
+            bracket_loss = np.sum(np.where(errors > 1.5, errors * 2, errors))
+            
+            # 2. Ensemble Penalty (regularization to force mixing, peaks at 0.5)
+            # We want to encourage diverse ensembles to prevent 100/0 model collapse
+            mixing_penalty = 10.0 * (w[0] - 0.5)**2  
+            
+            return bracket_loss + mixing_penalty
+            
+        res = minimize(blend_objective, [0.5], bounds=[(0.0, 1.0)])
+        opt_w = float(res.x[0])
+        
+        # Report TRUE holdout MAE on test set (80-100% chunk)
         p_xgb_test = m_xgb_val.predict(test[feat])
         p_lgbm_test = m_lgbm_val.predict(test[feat])
-        p_final = (p_xgb_test + p_lgbm_test) / 2
+        p_final = opt_w * p_xgb_test + (1 - opt_w) * p_lgbm_test
         mae = mean_absolute_error(test[target], p_final)
-        log.info(f"  📊 {station_id} {t_type} TRUE Holdout MAE (80-100%): {mae:.3f}°F")
-        log.info(f"     XGB best iters: {xgb_best_iter} | LGB best iters: {lgbm_best_iter}")
+        log.info(f"  📊 {station_id} {t_type} TRUE Holdout MAE: {mae:.3f}°F (Blend: {opt_w:.2f} XGB, {1-opt_w:.2f} LGBM)")
         
         # --- Phase 2: Retrain on 100% of data for production deployment ---
-        # Scale n_estimators proportionally: more data → more iterations to converge
-        scale_factor = len(df) / len(train)  # 100% / 60% ≈ 1.67
+        # Scale n_estimators conservatively (+10%) instead of linear scaling (1.67x)
+        # to prevent sudden severe overfitting of the tree ensembles.
         
         xgb_prod_params = params['xgb'].copy()
-        xgb_prod_params['n_estimators'] = int(xgb_best_iter * scale_factor)
-        # Remove early stopping keys for final training (no holdout to stop against)
-        xgb_prod_params.pop('early_stopping_rounds', None)
-        xgb_prod_params.pop('eval_metric', None)
+        xgb_prod_params['n_estimators'] = int(xgb_prod_params['n_estimators'] * 1.10)
         
         m_xgb_prod = xgb.XGBRegressor(**xgb_prod_params)
         m_xgb_prod.fit(df[feat], df[target])
         m_xgb_prod.save_model(xgb_path)
         
         lgbm_prod_params = params['lgbm'].copy()
-        lgbm_prod_params['n_estimators'] = int(lgbm_best_iter * scale_factor)
+        lgbm_prod_params['n_estimators'] = int(lgbm_prod_params['n_estimators'] * 1.10)
         
         m_lgbm_prod = lgb.LGBMRegressor(**lgbm_prod_params)
         m_lgbm_prod.fit(df[feat], df[target])
         m_lgbm_prod.booster_.save_model(lgbm_path)
         
-        log.info(f"  ✅ {station_id} {t_type} production model saved "
-                 f"(100% data, XGB iters: {xgb_prod_params['n_estimators']}, "
-                 f"LGB iters: {lgbm_prod_params['n_estimators']})")
+        # Save the optimal blend weight for the inference pipeline
+        blend_path = os.path.join(os.path.dirname(xgb_path), f"blend_{t_type.lower()}.json")
+        with open(blend_path, 'w') as f:
+            json.dump({'xgb_weight': opt_w, 'lgbm_weight': 1.0 - opt_w}, f, indent=4)
+            
+        log.info(f"  ✅ {station_id} {t_type} production model saved (100% data, +10% estimators)")
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -115,6 +128,15 @@ if __name__ == "__main__":
     
     log.info(f"🚀 Compiling Models for {len(stations)} stations via Multiprocessing...")
     
+    # Collect futures so crashed stations surface their exceptions
+    # instead of being silently swallowed by the executor.
+    futures = {}
     with ProcessPoolExecutor(max_workers=4) as executor:
         for s in stations:
-            executor.submit(train_station_models, s["station_id"], s["lat"], s["lon"])
+            f = executor.submit(train_station_models, s["station_id"], s["lat"], s["lon"])
+            futures[f] = s["station_id"]
+        for f in futures:
+            try:
+                f.result()
+            except Exception as e:
+                log.error(f"\u274c Training failed for {futures[f]}: {e}")

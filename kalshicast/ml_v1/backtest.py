@@ -12,7 +12,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy.optimize import minimize_scalar
 
 from kalshicast.ml_v1.config import get_model_path, FEATURES, CURRENT_VERSION, DATA_DIR
-from kalshicast.ml_v1.stations import get_stations
+from kalshicast.config.stations import get_stations
 
 log = logging.getLogger(__name__)
 
@@ -70,10 +70,19 @@ def run_stacked_backtest(station_id: str):
         val_p_lgbm = m_lgbm.predict(val_df[feats])
 
         best_w, min_val_mae = 0.5, 99.9
-        def _blend_mae(w):
+        def _blend_bracket_loss(w):
             p_w = (w * val_p_xgb) + ((1 - w) * val_p_lgbm)
-            return mean_absolute_error(val_df[actual_col], val_df[raw_f_col] + p_w)
-        result = minimize_scalar(_blend_mae, bounds=(0, 1), method='bounded')
+            final_pred = val_df[raw_f_col] + p_w
+            
+            # Rule #8 Bracket Prioritization
+            errors = np.abs(val_df[actual_col].values - final_pred.values)
+            bracket_loss = np.sum(np.where(errors > 1.5, errors * 2, errors))
+            
+            # Anti-Collapse Regulariation (mixing penalty)
+            mixing_penalty = 10.0 * (w - 0.5)**2
+            return bracket_loss + mixing_penalty
+            
+        result = minimize_scalar(_blend_bracket_loss, bounds=(0, 1), method='bounded')
         best_w = result.x
         min_val_mae = result.fun
 
@@ -232,6 +241,60 @@ def run_stacked_backtest(station_id: str):
             json.dump(weights_by_target, f, indent=4)
         log.info(f"  💾 Saved enhanced blend weight and metrics to {weight_path}\n")
 
+def aggregate_backtest_results():
+    """Combines all blend_weight.json files into a single master summary CSV."""
+    import glob
+    
+    base_dir = os.path.join(DATA_DIR, "..", "models", CURRENT_VERSION)
+    results = []
+    
+    # We walk the directories explicitly
+    for station_dir in sorted(os.listdir(base_dir)):
+        station_path = os.path.join(base_dir, station_dir)
+        if not os.path.isdir(station_path):
+            continue
+            
+        for target in ['HIGH', 'LOW']:
+            weight_file = os.path.join(station_path, target, 'blend_weight.json')
+            if os.path.exists(weight_file):
+                with open(weight_file, 'r') as f:
+                    try:
+                        data = json.load(f)
+                    except json.JSONDecodeError:
+                        continue
+                        
+                if target in data:
+                    d = data[target]
+                    results.append({
+                        'station': station_dir,
+                        'target': target,
+                        'xgb_weight': d.get('xgb_weight'),
+                        'lgbm_weight': d.get('lgbm_weight'),
+                        'raw_gfs_mae': d.get('metrics_base', {}).get('raw_gfs_mae'),
+                        'opt_mae': d.get('metrics_opt', {}).get('holdout_mae'),
+                        'raw_gfs_rmse': d.get('metrics_base', {}).get('raw_gfs_rmse'),
+                        'opt_rmse': d.get('metrics_opt', {}).get('holdout_rmse'),
+                        'raw_gfs_bias': d.get('metrics_base', {}).get('raw_gfs_bias'),
+                        'opt_bias': d.get('metrics_opt', {}).get('holdout_bias'),
+                        'improvement_pct': d.get('improvement_pct'),
+                        'within_1F_raw': d.get('accuracy_thresholds', {}).get('within_1F_raw'),
+                        'within_1F_opt': d.get('accuracy_thresholds', {}).get('within_1F_opt'),
+                        'within_2F_raw': d.get('accuracy_thresholds', {}).get('within_2F_raw'),
+                        'within_2F_opt': d.get('accuracy_thresholds', {}).get('within_2F_opt'),
+                        'within_3F_raw': d.get('accuracy_thresholds', {}).get('within_3F_raw'),
+                        'within_3F_opt': d.get('accuracy_thresholds', {}).get('within_3F_opt')
+                    })
+                    
+    if not results:
+        log.warning("⚠️ No backtest results found to aggregate.")
+        return
+        
+    df = pd.DataFrame(results)
+    out_path = os.path.join(base_dir, "backtest_summary.csv")
+    df.to_csv(out_path, index=False)
+    log.info(f"\n✅ Successfully aggregated {len(df)} backtest results -> {out_path}")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     stations = get_stations(active_only=True)
@@ -239,3 +302,6 @@ if __name__ == "__main__":
     # We run backtests sequentially so the logs are highly readable
     for s in stations:
         run_stacked_backtest(s["station_id"])
+        
+    # Aggregate compiled results across the entire run
+    aggregate_backtest_results()

@@ -22,25 +22,25 @@ The pipeline prioritizes production realism and statistical integrity over raw d
 ## 2. Model Tuning (`tune.py`)
 
 - **Optimizer:** Optuna (TPESampler with fixed seed 42 for reproducibility).
-- **Strategy (M1):** Replaced single-split tuning with **3-fold TimeSeriesSplit**. Hyperparameters are validated across multiple expanding seasonal windows.
+- **Strategy (M1 / Hardened):** Upgraded from generic expanding windows to a **6-fold Walk-Forward TimeSeriesSplit** operating over strict 45-day blocks. Hyperparameters are validated uniformly across rotating macro-seasons, completely eradicating specific-season early-stopping bias.
 - **Search Space (M3):** Includes regularization parameters (`reg_alpha`, `reg_lambda`, `lambda_l1`, `lambda_l2`) to prevent overfitting on small station datasets.
-- **Outcome:** Generates `params.json` with robust, cross-validated settings and optimal `n_estimators`.
+- **Outcome:** Generates `params.json` with highly robust, cross-validated settings and global optimal `n_estimators`.
 
 ---
 
 ## 3. Training & Production Compilation (`train.py`)
 
-A two-phase approach that strictly isolates test data.
+A two-phase approach that tightly synchronizes with the output of `tune.py` to prevent redundant seasonal overfitting.
 
-### Phase 1: Holdout Validation (60/20/20)
-- **Train (0-60%):** Fits the trees.
-- **Validation (60-80%):** Target for **Early Stopping** to discover iteration counts.
-- **Test (80-100%):** **True Holdout**. Never seen by training or stopping logic.
-- **Output:** Phase 1 models are saved as `model_backtest.*` for honest evaluation.
+### Phase 1: Backtest and Blend Configuration (60/20/20)
+- **Train (0-60%):** Fits the trees using the optimal `n_estimators` dynamically loaded from `params.json`. *No secondary early stopping is used, trusting the robust walk-forward calculation.*
+- **Blend Optimization (60-80%):** Validates and blends XGBoost + LightGBM to minimize Custom Bracket Loss.
+- **Test (80-100%):** **True Holdout**. Never seen by training or blend weight logic.
+- **Output:** Phase 1 models are saved as `model_backtest.*` alongside the globally optimized `blend_weight.json`.
 
 ### Phase 2: Production Scaling (100%)
-- Retrains on **100% of data** using scaled iterations.
-- **Scaling Factor:** `n_estimators` from Phase 1 is scaled by **1.67x** (100/60) to account for the larger data base.
+- Retrains on **100% of data** using carefully constrained iterations.
+- **Scaling Factor:** Base `n_estimators` from tuning is scaled by **1.10x** (a conservative +10% boost) to account for the extra data volume, replacing the structurally dangerous 1.67x linear multiplier.
 - **Output:** Saves final production artifacts (`model.json` / `model.txt`).
 
 ---
@@ -48,12 +48,13 @@ A two-phase approach that strictly isolates test data.
 ## 4. Backtesting & Ensembling (`backtest.py`)
 
 ### Out-of-Sample Evaluation (C3)
-- Backtest now loads `model_backtest.*` files (trained on 60%) to evaluate on the final 20% test set.
-- **Zero Leakage:** Prevents the "evaluating on training data" bug.
+- Backtest strictly loads `model_backtest.*` files (trained on 0-60%) to execute evaluation sweeps on the untouched 80-100% test set.
+- **Zero Leakage:** Complete logical separation preventing recursive data evaluation.
 
-### Precise Ensembling (N1)
-- **Blend Optimization:** Uses `scipy.optimize.minimize_scalar` (bounded) to find the exact optimal blend weight (XGB vs LGBM) on the validation set.
-- **Diagnostics:** Comprehensive bias analysis by Month, Magnitude (Cold/Normal/Hot), and MAE thresholds.
+### Kalshicast-Specific Objective Ensembling (N1)
+- **Bracket Prioritization (Rule #8):** Eliminated vanilla MAE from blending calculations. Weight optimization explicitly utilizes a Custom Bracket Loss function aggressively taxing error radii extending beyond 1.5°F natively to protect perfect Kalshi hit payouts.
+- **Anti-Collapse (Rule #6):** Features a dedicated L2 Mixing Penalty matrix to terminate ensemble monopole decay, mathematically ensuring diverse deployment matrices and preventing 1.0/0.0 single-model collapses.
+- **Diagnostics:** Comprehensive bias analysis by Month, Magnitude (Cold/Normal/Hot), and MAE thresholds natively exported.
 
 ---
 
