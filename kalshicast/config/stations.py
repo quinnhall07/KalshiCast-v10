@@ -318,7 +318,6 @@ def get_stations(*, active_only: bool = True) -> list[dict[str, Any]]:
         return [s for s in STATIONS if s.get("is_active")]
     return list(STATIONS)
 
-
 def get_station(station_id: str) -> dict[str, Any]:
     """Get station config by station_id. Raises KeyError if not found."""
     for s in STATIONS:

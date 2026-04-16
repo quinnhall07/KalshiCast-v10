@@ -11,35 +11,41 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from kalshicast.ml_v1.config import DATA_DIR
-from kalshicast.ml_v1.stations import get_stations, get_station
+from kalshicast.config.stations import get_stations, get_station
 
 log = logging.getLogger(__name__)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 
-def _fetch_iem_actuals(cli_site: str, state: str,
-                       start_date, end_date) -> pd.DataFrame:
-    """Fetch historical daily high/low from IEM ASOS.
+def _fetch_iem_actuals(cli_site: str, 
+                       start_date, end_date,
+                       tz: str = "Etc/UTC") -> pd.DataFrame:
+    """Fetch historical daily high/low from IEM ASOS hourly observations.
 
     Kalshi settles on NWS ASOS thermometers — IEM archives these
     observations and is the authoritative historical source.
 
     Uses 3-letter FAA codes (strip K from ICAO) per IEM convention.
+    Fetches hourly METAR observations via the asos.py endpoint (the
+    daily.py summary endpoint no longer returns temperature columns)
+    and aggregates to daily max/min using the station's local timezone
+    so calendar-day boundaries match Kalshi settlement.
+
     Sequential calls only; exponential backoff on 429/502/503.
     """
-    network = f"{state}_ASOS"
     url = (
-        f"https://mesonet.agron.iastate.edu/cgi-bin/request/daily.py?"
-        f"network={network}&stations={cli_site}"
+        "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py?"
+        f"station={cli_site}&data=tmpf"
         f"&year1={start_date.year}&month1={start_date.month}&day1={start_date.day}"
         f"&year2={end_date.year}&month2={end_date.month}&day2={end_date.day}"
-        f"&var=max_tmpf&var=min_tmpf&format=csv&na=blank"
+        f"&tz={tz}&format=onlycomma&latlon=no&elev=no"
+        f"&missing=M&trace=T&direct=no&report_type=3"
     )
     headers = {"User-Agent": "Kalshicast/10.0 (weather research)"}
 
     for attempt in range(5):
         try:
-            resp = requests.get(url, headers=headers, timeout=15)
+            resp = requests.get(url, headers=headers, timeout=30)
             if resp.status_code in (429, 502, 503):
                 wait = 3 ** attempt
                 log.warning("  ⏳ IEM %d, retrying in %ds...",
@@ -65,19 +71,48 @@ def _fetch_iem_actuals(cli_site: str, state: str,
         log.warning("⚠️ IEM returned unparseable response for %s", cli_site)
         return pd.DataFrame()
 
-    if df.empty or "max_tmpf" not in df.columns:
+    if df.empty or "tmpf" not in df.columns:
         log.warning("⚠️ IEM returned no usable data for %s", cli_site)
         return pd.DataFrame()
 
-    df = df.rename(columns={
-        "day": "time",
-        "max_tmpf": "actual_high",
-        "min_tmpf": "actual_low",
-    })
-    df["time"] = pd.to_datetime(df["time"])
-    df = df[["time", "actual_high", "actual_low"]].dropna()
-    return df
+    # Convert to numeric (M = missing → NaN) and aggregate to daily max/min
+    df["tmpf"] = pd.to_numeric(df["tmpf"], errors="coerce")
+    df["time"] = pd.to_datetime(df["valid"]).dt.date
 
+    # CRITICAL: Require at least 20 valid observations per day.
+    # Without this, a day with only 3 early-morning readings during a sensor
+    # reboot produces a "daily max" far below the actual afternoon high,
+    # poisoning target_error with phantom 10-15°F correction signals.
+    obs_per_day = df.groupby("time")["tmpf"].apply(lambda x: x.notna().sum())
+    valid_dates = obs_per_day[obs_per_day >= 20].index
+    df = df[df["time"].isin(valid_dates)]
+
+    daily = df.groupby("time")["tmpf"].agg(
+        actual_high="max", actual_low="min"
+    ).reset_index()
+    daily["time"] = pd.to_datetime(daily["time"])
+    daily = daily.dropna(subset=["actual_high", "actual_low"])
+    log.info("  ✅ Got %d days of IEM ASOS actuals for %s", len(daily), cli_site)
+    return daily
+
+
+def _fetch_with_retry(url: str, max_retries: int = 5, timeout=(5, 120)) -> requests.Response:
+    """Fetch URL with exponential backoff on 429/502/503."""
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code in (429, 502, 503):
+                wait = min(3 ** attempt, 60)
+                log.warning(f"  ⏳ API {resp.status_code}, retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as exc:
+            wait = min(3 ** attempt, 60)
+            log.warning(f"  ⏳ Request error ({exc}), retrying in {wait}s...")
+            time.sleep(wait)
+    raise requests.exceptions.ConnectionError(f"Failed after {max_retries} attempts: {url[:100]}")
 
 def fetch_bootstrap_data(station_id: str, lat: float, lon: float,
                          years_back: int = 3,
@@ -88,7 +123,6 @@ def fetch_bootstrap_data(station_id: str, lat: float, lon: float,
 
     station = get_station(station_id)
     cli_site = station["cli_site"]
-    state = station["state"]
     tz = station["timezone"]
 
     end_date = datetime.now(timezone.utc).date()
@@ -102,18 +136,25 @@ def fetch_bootstrap_data(station_id: str, lat: float, lon: float,
     # next-day temperatures. The Historical Forecast API concatenates 0-hour
     # analysis data, which has artificially small errors vs. production.
     #
-    # Previous Runs API: data available from Jan 2024+ (GFS temp from Apr 2021).
+    # Previous Runs API: data available from Feb 2024+ (GFS temp from Apr 2021).
     # For dates before that, we fall back to the Historical Forecast API and
     # flag the rows so we can track this in diagnostics.
     
-    PREV_RUNS_CUTOFF = datetime(2024, 1, 1).date()
+    PREV_RUNS_CUTOFF = datetime(2024, 2, 1).date()
     
-    # Variables we need, in both normal and previous_day1 form
+    # Variables we need for daily aggregation
+    # Historical Forecast API supports daily variables directly.
+    # Previous Runs API only supports hourly variables with _previous_day1
+    # suffix, so we fetch hourly and aggregate to daily ourselves.
     daily_vars_base = [
         "temperature_2m_max", "temperature_2m_min", "precipitation_sum",
         "wind_speed_10m_max", "shortwave_radiation_sum", "et0_fao_evapotranspiration"
     ]
-    daily_vars_prev = [f"{v}_previous_day1" for v in daily_vars_base]
+    hourly_vars_prev = [
+        "temperature_2m_previous_day1", "precipitation_previous_day1",
+        "wind_speed_10m_previous_day1", "shortwave_radiation_previous_day1",
+        "et0_fao_evapotranspiration_previous_day1"
+    ]
     
     rename_map = {
         "temperature_2m_max": "forecast_high",
@@ -123,11 +164,12 @@ def fetch_bootstrap_data(station_id: str, lat: float, lon: float,
         "shortwave_radiation_sum": "forecast_radiation",
         "et0_fao_evapotranspiration": "forecast_evap",
     }
-    rename_map_prev = {f"{k}_previous_day1": v for k, v in rename_map.items()}
     
     frames = []
     
     # Phase 1: Previous Runs API for dates >= Jan 2024 (realistic lead time)
+    # Uses HOURLY variables and aggregates to daily, because the Previous
+    # Runs API does not support daily aggregate variables.
     prev_start = max(start_date, PREV_RUNS_CUTOFF)
     if prev_start < end_date:
         prev_start_str = prev_start.strftime('%Y-%m-%d')
@@ -135,18 +177,53 @@ def fetch_bootstrap_data(station_id: str, lat: float, lon: float,
         prev_url = (
             f"https://previous-runs-api.open-meteo.com/v1/forecast?"
             f"latitude={lat}&longitude={lon}&start_date={prev_start_str}&end_date={end_str}"
-            f"&daily={','.join(daily_vars_prev)}"
+            f"&hourly={','.join(hourly_vars_prev)}"
             f"&models=gfs_seamless"
             f"&temperature_unit=fahrenheit&precipitation_unit=inch&wind_speed_unit=mph"
             f"&timezone={tz}"
         )
         try:
-            prev_resp = requests.get(prev_url, timeout=(5, 60))
-            prev_resp.raise_for_status()
-            prev_df = pd.DataFrame(prev_resp.json()["daily"]).rename(columns=rename_map_prev)
-            prev_df['forecast_lead_hours'] = 24  # True day-ahead forecast
-            frames.append(prev_df)
-            log.info(f"  ✅ Got {len(prev_df)} days from Previous Runs API")
+            prev_resp = _fetch_with_retry(prev_url)
+            data = prev_resp.json()
+            if "hourly" not in data:
+                raise ValueError(f"Open-Meteo missing 'hourly' key. Response: {str(data)[:200]}")
+            
+            hdf = pd.DataFrame(data["hourly"])
+            hdf["time"] = pd.to_datetime(hdf["time"])
+            
+            # Drop NaNs at edge boundaries before they corrupt daily aggregations
+            hdf["temperature_2m_previous_day1"] = pd.to_numeric(hdf["temperature_2m_previous_day1"], errors="coerce")
+            hdf = hdf.dropna(subset=["temperature_2m_previous_day1"])
+            
+            hdf["date"] = hdf["time"].dt.date
+            
+            # CRITICAL: Only aggregate days that have all 24 hours. Partial days skew max/min.
+            valid_days = hdf.groupby("date").filter(lambda x: len(x) >= 24)
+
+            # Aggregate hourly → daily: max/min for temp, sum for precip/radiation/evap, max for wind
+            if not valid_days.empty:
+                prev_df = pd.DataFrame({
+                    "time": valid_days.groupby("date")["time"].first().values,
+                    "forecast_high": valid_days.groupby("date")["temperature_2m_previous_day1"].max().values,
+                    "forecast_low": valid_days.groupby("date")["temperature_2m_previous_day1"].min().values,
+                    "forecast_precip": valid_days.groupby("date")["precipitation_previous_day1"].sum(min_count=1).values,
+                    "forecast_wind": valid_days.groupby("date")["wind_speed_10m_previous_day1"].max().values,
+                    "forecast_radiation": valid_days.groupby("date")["shortwave_radiation_previous_day1"].sum(min_count=1).values,
+                    "forecast_evap": valid_days.groupby("date")["et0_fao_evapotranspiration_previous_day1"].sum(min_count=1).values,
+                })
+                prev_df["time"] = pd.to_datetime(prev_df["time"]).dt.normalize()
+                prev_df['forecast_lead_hours'] = 24  # True day-ahead forecast
+                frames.append(prev_df)
+                log.info(f"  ✅ Got {len(prev_df)} days from Previous Runs API (hourly→daily)")
+            else:
+                raise ValueError("No valid full 24-hour days found in Previous Runs API response.")
+        except requests.exceptions.ConnectionError as e:
+            # All retries exhausted — this is a hard infrastructure failure.
+            # Do NOT silently fall back to 0h analysis data, which would
+            # destroy the 24h-lead training premise without anyone noticing.
+            log.error(f"❌ Previous Runs API exhausted all retries for {station_id}: {e}")
+            log.error("   Skipping station entirely (will not fall back to 0h data).")
+            return pd.DataFrame()
         except Exception as e:
             log.warning(f"⚠️ Previous Runs API failed for {station_id}: {e}")
             log.warning("   Falling back to Historical Forecast API for this range.")
@@ -157,7 +234,7 @@ def fetch_bootstrap_data(station_id: str, lat: float, lon: float,
     hist_end = prev_start - timedelta(days=1) if frames else end_date
     if start_date <= hist_end:
         hist_end_str = hist_end.strftime('%Y-%m-%d')
-        fallback_start_str = start_str if not frames else start_str
+        fallback_start_str = start_str
         log.info(f"📥 Downloading GFS historical forecasts for {station_id} ({fallback_start_str} → {hist_end_str})...")
         hist_url = (
             f"https://historical-forecast-api.open-meteo.com/v1/forecast?"
@@ -168,9 +245,12 @@ def fetch_bootstrap_data(station_id: str, lat: float, lon: float,
             f"&timezone={tz}"
         )
         try:
-            hist_resp = requests.get(hist_url, timeout=(5, 60))
-            hist_resp.raise_for_status()
-            hist_df = pd.DataFrame(hist_resp.json()["daily"]).rename(columns=rename_map)
+            hist_resp = _fetch_with_retry(hist_url)
+            data = hist_resp.json()
+            if "daily" not in data:
+                raise ValueError(f"Open-Meteo missing 'daily' key. Response: {str(data)[:200]}")
+            
+            hist_df = pd.DataFrame(data["daily"]).rename(columns=rename_map)
             hist_df['forecast_lead_hours'] = 0  # ~0h analysis data (less realistic)
             frames.append(hist_df)
             log.info(f"  ✅ Got {len(hist_df)} days from Historical Forecast API (0h lead)")
@@ -185,7 +265,7 @@ def fetch_bootstrap_data(station_id: str, lat: float, lon: float,
 
     # --- Actuals from IEM ASOS (Kalshi settlement source) ---
     log.info(f"📥 Downloading IEM ASOS actuals for {station_id} ({cli_site})...")
-    a_df = _fetch_iem_actuals(cli_site, state, start_date, end_date)
+    a_df = _fetch_iem_actuals(cli_site, start_date, end_date, tz=tz)
     if a_df.empty:
         return pd.DataFrame()
 
@@ -248,11 +328,20 @@ def fetch_bootstrap_data(station_id: str, lat: float, lon: float,
         err = df[f'actual_{t}'] - df[f'forecast_{t}']
         df[f'target_error_{t}'] = err
 
-        df[f'lag_{t}_1d'] = err.shift(1)
-        df[f'lag_{t}_2d'] = err.shift(2)
-        df[f'roll_{t}_7d_mean'] = err.shift(1).rolling(7).mean()
-        df[f'roll_{t}_14d_mean'] = err.shift(1).rolling(14).mean()
-        df[f'roll_{t}_7d_std'] = err.shift(1).rolling(7).std()
+        # "Conservative Resilience" Feature Engineering:
+        # 1. Limited forward-fill (max 2 days) to bridge small station outages.
+        #    This prevents a 1-day sensor gap from poisoning the next 2 weeks of training.
+        s1 = err.shift(1).ffill(limit=2)
+        s2 = err.shift(2).ffill(limit=2)
+        
+        df[f'lag_{t}_1d'] = s1
+        df[f'lag_{t}_2d'] = s2
+        
+        # 2. Use min_periods to allow windows with partial data (requires at least 50% coverage).
+        #    This recovers days that would otherwise be NaN due to a single missing point in the window.
+        df[f'roll_{t}_7d_mean'] = s1.rolling(7, min_periods=4).mean()
+        df[f'roll_{t}_14d_mean'] = s1.rolling(14, min_periods=7).mean()
+        df[f'roll_{t}_7d_std'] = s1.rolling(7, min_periods=4).std()
 
     # --- Diagnose NaN dropout bias ---
     # IEM stations often go offline during severe weather (storms, ice, extreme heat).
@@ -283,6 +372,12 @@ def fetch_bootstrap_data(station_id: str, lat: float, lon: float,
         'roll_high_7d_std', 'roll_low_7d_std',
     ])
     log.info(f"  📉 Dropped {pre_drop - len(df)} rows (gap days + warmup)")
+
+    # Remove internal bookkeeping column before persisting.
+    # If this leaks into training features, the model learns a trivial rule:
+    # "if forecast_lead_hours == 0, errors are small" — instant data leakage.
+    df = df.drop(columns=['forecast_lead_hours'], errors='ignore')
+
     df.to_csv(csv_path, index=False)
     log.info(f"✅ Saved {len(df)} days of IEM-sourced data for {station_id}")
     return df
@@ -295,7 +390,9 @@ if __name__ == "__main__":
     log.info(f"🚀 Bootstrapping data for {len(stations)} stations...")
     log.info("   (Sequential fetch — IEM academic API rate limits)")
 
-    for s in stations:
-        fetch_bootstrap_data(s["station_id"], s["lat"], s["lon"])
+    for i, s in enumerate(stations):
+        fetch_bootstrap_data(s["station_id"], s["lat"], s["lon"], force_refresh=True)
+        if i < len(stations) - 1:
+            time.sleep(2)  # Respect Open-Meteo rate limits
 
     log.info("✅ All station data downloaded and engineered.")
