@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
-"""Discover correct Kalshi city codes for weather series."""
+"""Discover correct Kalshi city codes - checks both KXHIGH and KXHIGHT patterns."""
 
 import requests
 import time
 
 BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
-# Cities we care about and possible code variants to try
+# All prefixes to try (KXHIGH/KXLOW and KXHIGHT/KXLOWT)
+HIGH_PREFIXES = ["KXHIGH", "KXHIGHT"]
+LOW_PREFIXES = ["KXLOW", "KXLOWT"]
+
+# Cities and code variants
 CITIES = {
-    "New York": ["NY", "NYC", "NEWYORK"],
-    "Miami": ["MIA", "MI", "MIAMI"],
-    "Chicago": ["CHI", "CH", "CHICAGO", "MDW"],
-    "Los Angeles": ["LA", "LAX", "LOS"],
-    "Austin": ["AUS", "AU", "AUSTIN"],
-    "Denver": ["DEN", "DE", "DENVER"],
-    "Seattle": ["SEA", "SE", "SEATTLE"],
-    "San Francisco": ["SFO", "SF", "SANFRAN"],
-    "Washington DC": ["DCA", "DC", "WAS", "WASH"],
-    "Boston": ["BOS", "BO", "BOSTON"],
-    "Atlanta": ["ATL", "AT", "ATLANTA"],
-    "Phoenix": ["PHX", "PH", "PHOENIX"],
-    "San Antonio": ["SAT", "SA", "SANANT"],
-    "Dallas": ["DFW", "DAL", "DALLAS"],
-    "Houston": ["HOU", "HO", "HOUSTON", "IAH"],
-    "Las Vegas": ["LAS", "LV", "VEGAS"],
-    "Philadelphia": ["PHL", "PH", "PHILA"],
-    "New Orleans": ["MSY", "NO", "NEWORLEANS"],
-    "Minneapolis": ["MSP", "MIN", "MPLS"],
-    "Oklahoma City": ["OKC", "OK", "OKLAHOMA"],
+    "New York": ["NY", "NYC"],
+    "Miami": ["MIA", "MI"],
+    "Chicago": ["CHI", "MDW"],
+    "Los Angeles": ["LAX", "LA"],
+    "Austin": ["AUS"],
+    "Denver": ["DEN"],
+    "Seattle": ["SEA"],
+    "San Francisco": ["SFO", "SF"],
+    "Washington DC": ["DC", "DCA", "WAS"],
+    "Boston": ["BOS"],
+    "Atlanta": ["ATL"],
+    "Phoenix": ["PHX"],
+    "San Antonio": ["SAT", "SA"],
+    "Dallas": ["DFW", "DAL"],
+    "Houston": ["HOU", "IAH"],
+    "Las Vegas": ["LAS", "LV"],
+    "Philadelphia": ["PHL", "PHI"],
+    "New Orleans": ["MSY", "NO"],
+    "Minneapolis": ["MSP", "MIN"],
+    "Oklahoma City": ["OKC"],
 }
 
 def check_series(series_ticker):
@@ -40,55 +44,76 @@ def check_series(series_ticker):
 
 def main():
     print("=" * 70)
-    print("KALSHI WEATHER CITY CODE DISCOVERY")
+    print("KALSHI WEATHER CITY CODE DISCOVERY v2")
+    print("Checking both KXHIGH/KXLOW and KXHIGHT/KXLOWT patterns")
     print("=" * 70)
     print()
     
-    found_codes = {}
+    results = {}
     
-    for city, variants in CITIES.items():
+    for city, codes in CITIES.items():
         print(f"{city}:")
         found_high = None
         found_low = None
         
-        for code in variants:
-            # Check HIGH
-            high_series = f"KXHIGH{code}"
-            low_series = f"KXLOW{code}"
+        # Try all combinations of prefix + city code
+        for code in codes:
+            if not found_high:
+                for prefix in HIGH_PREFIXES:
+                    series = f"{prefix}{code}"
+                    if check_series(series):
+                        found_high = series
+                        print(f"  ✓ HIGH: {series}")
+                        break
+                    time.sleep(0.15)
             
-            if not found_high and check_series(high_series):
-                found_high = code
-                print(f"  ✓ HIGH: KXHIGH{code}")
-            
-            time.sleep(0.1)  # Rate limit
-            
-            if not found_low and check_series(low_series):
-                found_low = code
-                print(f"  ✓ LOW:  KXLOW{code}")
-            
-            time.sleep(0.1)
+            if not found_low:
+                for prefix in LOW_PREFIXES:
+                    series = f"{prefix}{code}"
+                    if check_series(series):
+                        found_low = series
+                        print(f"  ✓ LOW:  {series}")
+                        break
+                    time.sleep(0.15)
             
             if found_high and found_low:
                 break
         
         if not found_high:
-            print(f"  ✗ HIGH: not found (tried {', '.join('KXHIGH'+v for v in variants)})")
+            tried = [f"{p}{c}" for c in codes for p in HIGH_PREFIXES]
+            print(f"  ✗ HIGH: not found (tried {', '.join(tried)})")
         if not found_low:
-            print(f"  ✗ LOW:  not found (tried {', '.join('KXLOW'+v for v in variants)})")
+            tried = [f"{p}{c}" for c in codes for p in LOW_PREFIXES]
+            print(f"  ✗ LOW:  not found (tried {', '.join(tried)})")
         
-        found_codes[city] = {"high": found_high, "low": found_low}
+        results[city] = {"high": found_high, "low": found_low}
         print()
     
     print("=" * 70)
-    print("SUMMARY - Correct Kalshi city codes:")
+    print("SUMMARY - Kalshi series tickers:")
     print("=" * 70)
-    for city, codes in found_codes.items():
-        h = codes['high'] or '???'
-        l = codes['low'] or '???'
-        print(f"  {city:20} HIGH={h:6} LOW={l:6}")
+    print(f"{'City':<20} {'HIGH Series':<20} {'LOW Series':<20}")
+    print("-" * 60)
+    for city, data in results.items():
+        h = data['high'] or '(not found)'
+        l = data['low'] or '(not found)'
+        print(f"{city:<20} {h:<20} {l:<20}")
     
     print()
     print("=" * 70)
+    print("STATION CONFIG UPDATE NEEDED:")
+    print("=" * 70)
+    for city, data in results.items():
+        if data['high'] or data['low']:
+            # Extract the pattern
+            sample = data['high'] or data['low']
+            if 'KXHIGHT' in sample or 'KXLOWT' in sample:
+                pattern = "KXHIGHT/KXLOWT"
+                code = sample.replace('KXHIGHT', '').replace('KXLOWT', '')
+            else:
+                pattern = "KXHIGH/KXLOW"
+                code = sample.replace('KXHIGH', '').replace('KXLOW', '')
+            print(f'  "{city}": kalshi_city="{code}", pattern="{pattern}"')
 
 if __name__ == "__main__":
     main()
