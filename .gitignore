@@ -9,3 +9,8 @@ build/
 *.key
 .venv/
 venv/
+
+kalshicast/ml_v1/data/
+kalshicast/ml_v1/models/
+.claude/
+.agents/
