@@ -254,6 +254,11 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
         "Kalshi: fetched %d weather events from %d/%d station series",
         total_fetched, nonzero_series, len(per_series_counts),
     )
+    for series_ticker, n in per_series_counts:
+        if n > 0:
+            log.info("  Kalshi: %s -> %d events", series_ticker, n)
+        else:
+            log.debug("  Kalshi: %s -> 0 events", series_ticker)
 
     if total_fetched == 0:
         log.warning(
