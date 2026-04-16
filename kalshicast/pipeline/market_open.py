@@ -200,6 +200,7 @@ def main() -> None:
 
                 from kalshicast.pipeline.paper_sim import create_paper_positions
                 n_paper = create_paper_positions(conn, pipeline_run_id)
+                total_bets = n_paper
                 log.info("Step 7.5 OK: %d paper positions created", n_paper)
 
                 if n_paper == 0:
