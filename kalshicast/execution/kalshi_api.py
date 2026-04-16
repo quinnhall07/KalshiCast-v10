@@ -22,7 +22,7 @@ from kalshicast.config.params_bootstrap import get_param_int, get_param_float
 
 log = logging.getLogger(__name__)
 
-DEFAULT_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+DEFAULT_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
 
 
 class KalshiClient:
