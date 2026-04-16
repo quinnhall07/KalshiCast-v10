@@ -1,90 +1,90 @@
 #!/usr/bin/env python3
-"""Diagnostic script to inspect raw Kalshi API responses.
+"""Diagnostic script to discover actual Kalshi weather series tickers.
 
-This script helps debug why certain weather markets aren't being fetched.
-It dumps the raw API response to show exactly what Kalshi returns.
-
-Usage:
-    python scripts/kalshi_diagnostic.py
+Root cause: Kalshi uses KXHIGHNY not KXHIGHNYC for NYC weather.
+This script queries /markets to find actual series_tickers.
 """
 
-import sys
-import os
+import requests
 
-# Ensure the package is importable
-sys.path.insert(0, os.getcwd())
-
-from kalshicast.execution.kalshi_api import KalshiClient
-
+BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
 def main():
     print("=" * 70)
-    print("KALSHI API DIAGNOSTIC")
+    print("KALSHI WEATHER SERIES DISCOVERY")
     print("=" * 70)
+    print(f"Base URL: {BASE_URL}")
     print()
 
-    client = KalshiClient()
-    print(f"Base URL: {client.base_url}")
-    print(f"API Key ID: {client.api_key_id[:8]}..." if client.api_key_id else "API Key ID: NOT SET")
-    print()
-
-    # Fetch ALL open events (no series filter)
-    print("Fetching all open events (limit=200)...")
-    try:
-        all_events = client.get_events(status="open", limit=200)
-    except Exception as e:
-        print(f"ERROR fetching events: {e}")
-        sys.exit(1)
-
-    print(f"Total open events returned: {len(all_events)}")
-    if len(all_events) >= 200:
-        print("WARNING: Hit 200 limit - there may be more events!")
-    print()
-
-    # Filter for weather-related events
-    weather_keywords = ["KXHIGH", "KXLOW", "HIGH", "LOW", "TEMP", "WEATHER"]
-    weather = [
-        e for e in all_events 
-        if any(kw in e.get("event_ticker", "").upper() for kw in weather_keywords)
-    ]
+    # Query markets endpoint with weather-related filters
+    # Try to find all KXHIGH* and KXLOW* markets
+    print("Querying /markets for weather series...")
     
-    print(f"Weather-related events found: {len(weather)}")
+    all_weather_markets = []
+    cursor = None
+    
+    while True:
+        params = {"limit": 200, "status": "open"}
+        if cursor:
+            params["cursor"] = cursor
+            
+        resp = requests.get(f"{BASE_URL}/markets", params=params)
+        if resp.status_code != 200:
+            print(f"Error: {resp.status_code} - {resp.text[:200]}")
+            break
+            
+        data = resp.json()
+        markets = data.get("markets", [])
+        
+        # Filter for weather markets
+        weather = [m for m in markets if m.get("series_ticker", "").startswith(("KXHIGH", "KXLOW"))]
+        all_weather_markets.extend(weather)
+        
+        # Check for more pages
+        cursor = data.get("cursor")
+        if not cursor or not markets:
+            break
+        print(f"  ... fetched {len(markets)} markets, {len(weather)} weather, continuing...")
+
+    print(f"\nTotal weather markets found: {len(all_weather_markets)}")
     print()
 
-    if weather:
-        print("WEATHER EVENTS:")
+    if all_weather_markets:
+        # Group by series_ticker
+        series_map = {}
+        for m in all_weather_markets:
+            st = m.get("series_ticker", "?")
+            if st not in series_map:
+                series_map[st] = []
+            series_map[st].append(m)
+
+        print("WEATHER SERIES FOUND:")
         print("-" * 70)
-        for e in sorted(weather, key=lambda x: x.get("event_ticker", "")):
-            et = e.get("event_ticker", "?")
-            st = e.get("series_ticker", "?")
-            title = e.get("title", "")[:50]
-            n_markets = len(e.get("markets", []))
-            status = e.get("status", "?")
-            print(f"  {et:25} series={st:20} mkts={n_markets:2} status={status:6} | {title}")
+        for st in sorted(series_map.keys()):
+            markets = series_map[st]
+            sample = markets[0]
+            print(f"  {st:20} ({len(markets):2} markets) | event: {sample.get('event_ticker', '?')[:30]}")
+
         print()
+        print("SAMPLE MARKET DETAILS:")
+        print("-" * 70)
+        for m in all_weather_markets[:5]:
+            print(f"  ticker:        {m.get('ticker')}")
+            print(f"  series_ticker: {m.get('series_ticker')}")
+            print(f"  event_ticker:  {m.get('event_ticker')}")
+            print(f"  title:         {m.get('title', '')[:60]}")
+            print()
     else:
-        print("NO WEATHER EVENTS FOUND!")
+        print("NO WEATHER MARKETS FOUND!")
         print()
-        print("First 30 events of ANY type:")
-        print("-" * 70)
-        for e in all_events[:30]:
-            et = e.get("event_ticker", "?")
-            st = e.get("series_ticker", "?")
-            title = e.get("title", "")[:50]
-            print(f"  {et:30} series={st:25} | {title}")
-        print()
-
-    # Unique series_tickers breakdown
-    all_series = {}
-    for e in all_events:
-        st = e.get("series_ticker", "(none)")
-        all_series[st] = all_series.get(st, 0) + 1
-
-    print("ALL SERIES_TICKERS (count of events):")
-    print("-" * 70)
-    for st, count in sorted(all_series.items(), key=lambda x: -x[1])[:40]:
-        weather_flag = " <-- WEATHER?" if any(kw in st.upper() for kw in ["HIGH", "LOW", "TEMP"]) else ""
-        print(f"  {st:35} {count:3} events{weather_flag}")
+        print("Trying to query known series directly...")
+        
+        # Try querying specific series we know should exist
+        test_series = ["KXHIGHNY", "KXHIGHNYC", "KXHIGHMIA", "KXHIGHCHI"]
+        for series in test_series:
+            resp = requests.get(f"{BASE_URL}/series/{series}")
+            status = "EXISTS" if resp.status_code == 200 else f"NOT FOUND ({resp.status_code})"
+            print(f"  {series}: {status}")
 
     print()
     print("=" * 70)
