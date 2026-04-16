@@ -11,6 +11,6 @@ build/
 venv/
 
 kalshicast/ml_v1/data/
-kalshicast/ml_v1/models/
+kalshicast/ml_v1/models/**/*.csv
 .claude/
 .agents/

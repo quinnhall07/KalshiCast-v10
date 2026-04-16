@@ -1,0 +1,25 @@
+{
+    "LOW": {
+        "xgb_weight": 0.652,
+        "lgbm_weight": 0.348,
+        "metrics_base": {
+            "raw_gfs_mae": 2.1737,
+            "raw_gfs_rmse": 2.6669,
+            "raw_gfs_bias": -0.865
+        },
+        "metrics_opt": {
+            "holdout_mae": 2.1537,
+            "holdout_rmse": 2.7679,
+            "holdout_bias": 1.4802
+        },
+        "accuracy_thresholds": {
+            "within_1F_raw": 28.75,
+            "within_1F_opt": 29.38,
+            "within_2F_raw": 56.88,
+            "within_2F_opt": 56.88,
+            "within_3F_raw": 74.38,
+            "within_3F_opt": 73.75
+        },
+        "improvement_pct": 0.92
+    }
+}
