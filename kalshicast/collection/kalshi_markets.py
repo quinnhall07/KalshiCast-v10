@@ -10,6 +10,7 @@ This module handles:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Any
@@ -191,7 +192,7 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
     """
     from kalshicast.db.operations import (
         upsert_kalshi_market, is_event_ignored,
-        kalshi_alert_exists, create_unknown_station_alert
+        insert_system_alert,
     )
     
     synced = 0
@@ -202,9 +203,9 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
     # Track which events we've already alerted on this run
     alerted_events: set[str] = set()
 
-    # Fetch weather events by broad series.  Kalshi organises series as
-    # "KXHIGH" / "KXLOW" (not per-city), so two calls cover every city.
-    # Events have city-specific event_tickers like "KXHIGHNYC-26APR16".
+    # Fetch weather events per-city series.  Kalshi requires per-city
+    # series tickers (e.g. KXHIGHNYC, KXLOWCHI) — bare prefixes like
+    # "KXHIGH" return nothing.
     log.info("Kalshi: base_url=%s", getattr(client, "base_url", "?"))
     from kalshicast.config.stations import get_stations
 
@@ -212,63 +213,63 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
     weather_events: list[dict] = []
     per_series_counts: list[tuple[str, int]] = []
 
-    for series_prefix in ("KXHIGH", "KXLOW"):
-        try:
-            events = client.get_events(
-                status="open", series_ticker=series_prefix, limit=200,
-            )
-        except Exception as e:
-            log.warning("Kalshi: fetch %s failed: %s", series_prefix, e)
-            events = []
+    rate_limit_sleep = 0.25  # ~4 req/sec — stay well under Kalshi quota
 
-        # Keep only events whose event_ticker belongs to this series
-        events = [
-            e for e in events
-            if e.get("event_ticker", "").startswith(series_prefix)
-            or (e.get("series_ticker") or "").startswith(series_prefix)
-        ]
-        per_series_counts.append((series_prefix, len(events)))
-        weather_events.extend(events)
+    first_call = True
+    for station in stations:
+        city_code = station.get("kalshi_city") or station["cli_site"]
+        for series_prefix in ("KXHIGH", "KXLOW"):
+            if not first_call:
+                time.sleep(rate_limit_sleep)
+            first_call = False
+
+            series_ticker = f"{series_prefix}{city_code}"
+            try:
+                events = client.get_events(
+                    status="open", series_ticker=series_ticker, limit=200,
+                )
+            except Exception as e:
+                log.warning("Kalshi: fetch %s failed: %s", series_ticker, e)
+                continue
+
+            # Defensive filter: keep only events matching this series
+            events = [
+                e for e in events
+                if e.get("event_ticker", "").startswith(series_ticker + "-")
+                or e.get("series_ticker") == series_ticker
+            ]
+            per_series_counts.append((series_ticker, len(events)))
+            weather_events.extend(events)
 
     total_fetched = sum(n for _, n in per_series_counts)
+    nonzero_series = sum(1 for _, n in per_series_counts if n > 0)
     log.info(
-        "Kalshi: fetched %d weather events (%s)",
-        total_fetched,
-        ", ".join(f"{s}={n}" for s, n in per_series_counts),
+        "Kalshi: fetched %d weather events from %d/%d station series",
+        total_fetched, nonzero_series, len(per_series_counts),
     )
-
-    # Log per-city breakdown for transparency
-    city_event_map: dict[str, list[str]] = {}
-    for ev in weather_events:
-        et = ev.get("event_ticker", "")
-        try:
-            cc = extract_city_code(et)
-        except ValueError:
-            cc = "UNKNOWN"
-        city_event_map.setdefault(cc, []).append(et)
-    for cc in sorted(city_event_map):
-        log.info("  Kalshi: city=%s -> %d events: %s",
-                 cc, len(city_event_map[cc]),
-                 ", ".join(city_event_map[cc][:4]))
+    # Log per-series results (successes at INFO, empties at DEBUG)
+    for series_ticker, n in per_series_counts:
+        if n > 0:
+            log.info("  Kalshi: %s -> %d events", series_ticker, n)
+        else:
+            log.debug("  Kalshi: %s -> 0 events", series_ticker)
 
     # ── Coverage check: alert on missing stations ────────────────────
     expected_city_types: set[str] = set()
-    city_to_station: dict[str, str] = {}
     for s in stations:
         cc = s.get("kalshi_city") or s["cli_site"]
-        city_to_station[cc] = s["station_id"]
         expected_city_types.add(f"{cc}|HIGH")
         expected_city_types.add(f"{cc}|LOW")
 
     found_city_types: set[str] = set()
-    for ev in weather_events:
-        et = ev.get("event_ticker", "")
-        try:
-            cc = extract_city_code(et)
-        except ValueError:
-            continue
-        tt = "HIGH" if et.startswith("KXHIGH") else "LOW"
-        found_city_types.add(f"{cc}|{tt}")
+    for st, n in per_series_counts:
+        if n > 0:
+            try:
+                cc = st[6:] if st.startswith("KXHIGH") else st[5:]
+                tt = "HIGH" if st.startswith("KXHIGH") else "LOW"
+                found_city_types.add(f"{cc}|{tt}")
+            except Exception:
+                pass
 
     missing = expected_city_types - found_city_types
     if missing:
@@ -278,21 +279,27 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
             len(missing), len(expected_city_types),
             ", ".join(missing_list[:20]),
         )
-        create_unknown_station_alert(
-            conn,
-            "COVERAGE_GAP",
-            f"Missing {len(missing)}/{len(expected_city_types)} series",
-            ", ".join(missing_list[:10]),
-        )
+        insert_system_alert(conn, {
+            "alert_type": "KALSHI_COVERAGE_GAP",
+            "severity_score": 0.6,
+            "details": {
+                "missing_count": len(missing),
+                "expected_count": len(expected_city_types),
+                "missing_series": missing_list[:20],
+            },
+        })
     else:
         log.info("Kalshi: full coverage — all %d station series found",
                  len(expected_city_types))
 
     if total_fetched == 0:
         log.warning(
-            "Kalshi: no weather events returned. "
-            "Verify that KXHIGH/KXLOW series exist.",
+            "Kalshi: no weather events returned for any of %d station series. "
+            "Verify that KXHIGH/KXLOW series exist for these cities.",
+            len(per_series_counts),
         )
+        for st, _ in per_series_counts[:20]:
+            log.warning("    queried %s -> 0 events", st)
 
     for event in weather_events:
         event_ticker = event.get("event_ticker", "")
@@ -367,10 +374,17 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
 
         # Create alert for unmatched station (once per event)
         if station_id is None and event_ticker not in alerted_events:
-            if not kalshi_alert_exists(conn, event_ticker):
-                sample_ticker = markets[0].get("ticker") if markets else event_ticker
-                create_unknown_station_alert(conn, event_ticker, market_title, sample_ticker)
-                log.warning("Unknown Kalshi station: %s (%s)", event_ticker, market_title)
+            insert_system_alert(conn, {
+                "alert_type": "UNKNOWN_KALSHI_STATION",
+                "severity_score": 0.5,
+                "details": {
+                    "event_ticker": event_ticker,
+                    "market_title": market_title,
+                    "sample_ticker": markets[0].get("ticker") if markets else event_ticker,
+                    "action_required": "Add station mapping to stations.py or add to KALSHI_IGNORED_EVENTS",
+                },
+            })
+            log.warning("Unknown Kalshi station: %s (%s)", event_ticker, market_title)
             alerted_events.add(event_ticker)
             unmatched += 1
 

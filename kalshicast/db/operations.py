@@ -1425,8 +1425,8 @@ def kalshi_alert_exists(conn: Any, event_ticker: str) -> bool:
         cur.execute("""
             SELECT 1 FROM SYSTEM_ALERTS
             WHERE ALERT_TYPE = 'UNKNOWN_KALSHI_STATION'
-              AND DETAILS LIKE :ref_pattern
-              AND STATUS = 'OPEN'
+              AND DETAILS_JSON LIKE :ref_pattern
+              AND IS_RESOLVED = 0
         """, {"ref_pattern": f'%{event_ticker}%'})
         return cur.fetchone() is not None
 
@@ -1439,14 +1439,12 @@ def create_unknown_station_alert(conn: Any, event_ticker: str,
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO SYSTEM_ALERTS (
-                ALERT_ID, ALERT_TYPE, SEVERITY, TITLE, DETAILS, STATUS, CREATED_AT
+                ALERT_ID, ALERT_TYPE, SEVERITY_SCORE, DETAILS_JSON
             ) VALUES (
-                :aid, 'UNKNOWN_KALSHI_STATION', 'WARNING',
-                :title, :details, 'OPEN', SYSTIMESTAMP
+                :aid, 'UNKNOWN_KALSHI_STATION', 0.5, :details
             )
         """, {
             "aid": str(uuid.uuid4()),
-            "title": f"Unmatched Kalshi market: {event_ticker}",
             "details": json.dumps({
                 "event_ticker": event_ticker,
                 "market_title": market_title,
