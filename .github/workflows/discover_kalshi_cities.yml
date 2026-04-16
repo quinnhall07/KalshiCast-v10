@@ -1,0 +1,20 @@
+name: Discover Kalshi City Codes
+on:
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Discover Kalshi city codes
+        run: python scripts/discover_kalshi_cities.py
