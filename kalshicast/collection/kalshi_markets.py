@@ -225,20 +225,38 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
 
             series_ticker = f"{series_prefix}{city_code}"
             try:
-                events = client.get_events(
+                raw_events = client.get_events(
                     status="open", series_ticker=series_ticker, limit=200,
                 )
             except Exception as e:
                 log.warning("Kalshi: fetch %s failed: %s", series_ticker, e)
+                per_series_counts.append((series_ticker, 0))
                 continue
 
             # Defensive filter: keep only events matching this series
             events = [
-                e for e in events
+                e for e in raw_events
                 if e.get("event_ticker", "").startswith(series_ticker + "-")
                 or e.get("series_ticker") == series_ticker
             ]
-            per_series_counts.append((series_ticker, len(events)))
+
+            n_raw = len(raw_events)
+            n_filtered = len(events)
+            if n_raw > 0 and n_filtered < n_raw:
+                dropped = [e.get("event_ticker", "?") for e in raw_events
+                           if e not in events]
+                log.warning(
+                    "Kalshi: %s returned %d events, kept %d after filter "
+                    "(dropped: %s)",
+                    series_ticker, n_raw, n_filtered,
+                    ", ".join(dropped[:5]),
+                )
+            elif n_raw > 0:
+                tickers = [e.get("event_ticker", "?") for e in events]
+                log.info("  Kalshi: %s -> %d events: %s",
+                         series_ticker, n_filtered, ", ".join(tickers))
+
+            per_series_counts.append((series_ticker, n_filtered))
             weather_events.extend(events)
 
     total_fetched = sum(n for _, n in per_series_counts)
@@ -247,12 +265,39 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
         "Kalshi: fetched %d weather events from %d/%d station series",
         total_fetched, nonzero_series, len(per_series_counts),
     )
-    # Log per-series results (successes at INFO, empties at DEBUG)
-    for series_ticker, n in per_series_counts:
-        if n > 0:
-            log.info("  Kalshi: %s -> %d events", series_ticker, n)
-        else:
-            log.debug("  Kalshi: %s -> 0 events", series_ticker)
+    empty_series = [s for s, n in per_series_counts if n == 0]
+    if empty_series:
+        log.warning(
+            "Kalshi: %d/%d series returned 0 events: %s",
+            len(empty_series), len(per_series_counts),
+            ", ".join(empty_series[:30]),
+        )
+
+        # ── Diagnostic probe: for first 3 empty series, retry without
+        #    status filter to see if events exist in non-open states.
+        for probe_ticker in empty_series[:3]:
+            time.sleep(rate_limit_sleep)
+            try:
+                probe_events = client.get_events(
+                    status="", series_ticker=probe_ticker, limit=5,
+                )
+                if probe_events:
+                    statuses = [e.get("status", "?") for e in probe_events]
+                    tickers = [e.get("event_ticker", "?") for e in probe_events]
+                    log.warning(
+                        "  Kalshi PROBE %s (no status filter): %d events "
+                        "statuses=%s tickers=%s",
+                        probe_ticker, len(probe_events),
+                        statuses, tickers[:3],
+                    )
+                else:
+                    log.warning(
+                        "  Kalshi PROBE %s (no status filter): still 0 events "
+                        "— series may not exist on Kalshi",
+                        probe_ticker,
+                    )
+            except Exception as e:
+                log.warning("  Kalshi PROBE %s failed: %s", probe_ticker, e)
 
     # ── Coverage check: alert on missing stations ────────────────────
     expected_city_types: set[str] = set()
