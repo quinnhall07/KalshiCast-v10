@@ -1,4 +1,4 @@
-"""20 active NWS ASOS observation stations."""
+"""20 active NWS ASOS observation stations with Kalshi market mappings."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KNYC",
         "cli_site": "NYC",
+        "kalshi_high_series": "KXHIGHNY",
+        "kalshi_low_series": "KXLOWNY",
         "name": "NYC Central Park",
         "state": "NY",
         "city": "New York City",
@@ -21,6 +23,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KMIA",
         "cli_site": "MIA",
+        "kalshi_high_series": "KXHIGHMIA",
+        "kalshi_low_series": "KXLOWMIA",
         "name": "Miami International Airport",
         "state": "FL",
         "city": "Miami",
@@ -34,6 +38,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KMSY",
         "cli_site": "MSY",
+        "kalshi_high_series": "KXHIGHTNOLA",
+        "kalshi_low_series": "KXLOWTNOLA",
         "name": "New Orleans International Airport",
         "state": "LA",
         "city": "New Orleans",
@@ -47,6 +53,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KPHL",
         "cli_site": "PHL",
+        "kalshi_high_series": "KXHIGHPHIL",
+        "kalshi_low_series": "KXLOWTPHIL",
         "name": "Philadelphia International Airport",
         "state": "PA",
         "city": "Philadelphia",
@@ -60,7 +68,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KMDW",
         "cli_site": "MDW",
-        "kalshi_city": "CHI",  # Kalshi uses CHI for Chicago
+        "kalshi_high_series": "KXHIGHCHI",
+        "kalshi_low_series": "KXLOWCHI",
         "name": "Chicago Midway Airport",
         "state": "IL",
         "city": "Chicago",
@@ -74,7 +83,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KLAX",
         "cli_site": "LAX",
-        "kalshi_city": "LA",  # Kalshi uses LA for Los Angeles
+        "kalshi_high_series": "KXHIGHLAX",
+        "kalshi_low_series": "KXLOWLAX",
         "name": "Los Angeles International Airport",
         "state": "CA",
         "city": "Los Angeles",
@@ -88,6 +98,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KAUS",
         "cli_site": "AUS",
+        "kalshi_high_series": "KXHIGHAUS",
+        "kalshi_low_series": "KXLOWAUS",
         "name": "Austin-Bergstrom International Airport",
         "state": "TX",
         "city": "Austin",
@@ -101,6 +113,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KDEN",
         "cli_site": "DEN",
+        "kalshi_high_series": "KXHIGHDEN",
+        "kalshi_low_series": "KXLOWDEN",
         "name": "Denver International Airport",
         "state": "CO",
         "city": "Denver",
@@ -114,6 +128,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KSEA",
         "cli_site": "SEA",
+        "kalshi_high_series": "KXHIGHTSEA",
+        "kalshi_low_series": "KXLOWTSEA",
         "name": "Seattle-Tacoma International Airport",
         "state": "WA",
         "city": "Seattle",
@@ -127,6 +143,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KLAS",
         "cli_site": "LAS",
+        "kalshi_high_series": "KXHIGHTLV",
+        "kalshi_low_series": "KXLOWTLV",
         "name": "Harry Reid International Airport",
         "state": "NV",
         "city": "Las Vegas",
@@ -140,6 +158,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KSFO",
         "cli_site": "SFO",
+        "kalshi_high_series": "KXHIGHTSFO",
+        "kalshi_low_series": "KXLOWTSFO",
         "name": "San Francisco International Airport",
         "state": "CA",
         "city": "San Francisco",
@@ -153,6 +173,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KDCA",
         "cli_site": "DCA",
+        "kalshi_high_series": "KXHIGHTDC",
+        "kalshi_low_series": "KXLOWTDC",
         "name": "Reagan National Airport",
         "state": "VA",
         "city": "Washington DC",
@@ -166,6 +188,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KBOS",
         "cli_site": "BOS",
+        "kalshi_high_series": "KXHIGHTBOS",
+        "kalshi_low_series": "KXLOWTBOS",
         "name": "Logan International Airport",
         "state": "MA",
         "city": "Boston",
@@ -179,6 +203,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KATL",
         "cli_site": "ATL",
+        "kalshi_high_series": "KXHIGHTATL",
+        "kalshi_low_series": "KXLOWTATL",
         "name": "Jackson Atlanta International Airport",
         "state": "GA",
         "city": "Atlanta",
@@ -192,10 +218,12 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KPHX",
         "cli_site": "PHX",
+        "kalshi_high_series": "KXHIGHTPHX",
+        "kalshi_low_series": "KXLOWTPHX",
         "name": "Phoenix Sky Harbor International Airport",
         "state": "AZ",
         "city": "Phoenix",
-        "timezone": "America/Phoenix",  # Arizona does NOT observe DST
+        "timezone": "America/Phoenix",
         "lat": 33.427799,
         "lon": -112.003465,
         "elevation_ft": 1115,
@@ -205,6 +233,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KSAT",
         "cli_site": "SAT",
+        "kalshi_high_series": "KXHIGHTSATX",
+        "kalshi_low_series": "KXLOWTSATX",
         "name": "San Antonio International Airport",
         "state": "TX",
         "city": "San Antonio",
@@ -218,6 +248,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KDFW",
         "cli_site": "DFW",
+        "kalshi_high_series": "KXHIGHTDAL",
+        "kalshi_low_series": "KXLOWTDAL",
         "name": "Dallas/Fort Worth International Airport",
         "state": "TX",
         "city": "Dallas",
@@ -231,6 +263,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KMSP",
         "cli_site": "MSP",
+        "kalshi_high_series": "KXHIGHTMIN",
+        "kalshi_low_series": "KXLOWTMIN",
         "name": "Minneapolis-St. Paul International Airport",
         "state": "MN",
         "city": "Minneapolis",
@@ -244,6 +278,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KHOU",
         "cli_site": "HOU",
+        "kalshi_high_series": "KXHIGHHOU",
+        "kalshi_low_series": "KXLOWTHOU",
         "name": "Houston Hobby Airport",
         "state": "TX",
         "city": "Houston",
@@ -257,6 +293,8 @@ STATIONS: list[dict[str, Any]] = [
     {
         "station_id": "KOKC",
         "cli_site": "OKC",
+        "kalshi_high_series": "KXHIGHTOKC",
+        "kalshi_low_series": "KXLOWTOKC",
         "name": "Will Rogers World Airport",
         "state": "OK",
         "city": "Oklahoma City",
@@ -270,29 +308,70 @@ STATIONS: list[dict[str, Any]] = [
 ]
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Lookup Functions
+# ─────────────────────────────────────────────────────────────────────
+
 def get_stations(*, active_only: bool = True) -> list[dict[str, Any]]:
+    """Return list of station configs."""
     if active_only:
         return [s for s in STATIONS if s.get("is_active")]
     return list(STATIONS)
 
-def get_kalshi_city(station_id: str) -> str:
-    """Get the Kalshi city code for a station.
+
+def get_station(station_id: str) -> dict[str, Any]:
+    """Get station config by station_id. Raises KeyError if not found."""
+    for s in STATIONS:
+        if s["station_id"] == station_id:
+            return s
+    raise KeyError(f"Unknown station: {station_id}")
+
+
+def get_station_by_kalshi_series(series_ticker: str) -> dict[str, Any] | None:
+    """Find station by Kalshi series ticker (e.g., KXHIGHNY, KXLOWTSFO).
     
-    Returns kalshi_city if set, otherwise cli_site.
+    Checks both kalshi_high_series and kalshi_low_series.
+    Returns None if no match.
     """
+    series_upper = series_ticker.upper()
+    for s in STATIONS:
+        if s.get("kalshi_high_series", "").upper() == series_upper:
+            return s
+        if s.get("kalshi_low_series", "").upper() == series_upper:
+            return s
+    return None
+
+
+def get_all_kalshi_series() -> list[str]:
+    """Return all known Kalshi series tickers for active stations."""
+    series = []
+    for s in STATIONS:
+        if not s.get("is_active"):
+            continue
+        if s.get("kalshi_high_series"):
+            series.append(s["kalshi_high_series"])
+        if s.get("kalshi_low_series"):
+            series.append(s["kalshi_low_series"])
+    return series
+
+
+# Legacy compatibility
+def get_kalshi_city(station_id: str) -> str:
+    """Deprecated: Get Kalshi city code. Use kalshi_high_series/kalshi_low_series instead."""
     station = get_station(station_id)
-    return station.get("kalshi_city", station["cli_site"])
+    # Extract city from series for backward compatibility
+    high_series = station.get("kalshi_high_series", "")
+    if high_series.startswith("KXHIGHT"):
+        return high_series[7:]
+    elif high_series.startswith("KXHIGH"):
+        return high_series[6:]
+    return station["cli_site"]
 
 
 def get_station_by_kalshi_city(kalshi_city: str) -> dict[str, Any] | None:
-    """Find station by Kalshi city code.
-    
-    Checks kalshi_city first, then cli_site.
-    Returns None if no match.
-    """
+    """Deprecated: Find station by Kalshi city code."""
     for s in STATIONS:
-        if s.get("kalshi_city") == kalshi_city:
-            return s
-        if s["cli_site"] == kalshi_city:
+        city = get_kalshi_city(s["station_id"])
+        if city.upper() == kalshi_city.upper():
             return s
     return None
