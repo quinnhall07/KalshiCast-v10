@@ -1,10 +1,11 @@
 """Kalshi market sync — fetch real tickers from Kalshi API.
 
 This module handles:
-1. Fetching active weather markets from Kalshi
+1. Fetching active weather markets from Kalshi (per-city, per-target_type)
 2. Parsing ticker strings to extract date/bin info
-3. Matching Kalshi series to our station IDs
+3. Matching Kalshi city codes to our station IDs
 4. Storing market data in KALSHI_MARKETS table
+5. Emitting a KALSHI_SYNC_EMPTY alert when no markets sync at all
 """
 
 from __future__ import annotations
@@ -21,153 +22,123 @@ log = logging.getLogger(__name__)
 # Ticker Parsing
 # ─────────────────────────────────────────────────────────────────────
 
-def extract_series_ticker(event_ticker: str) -> str:
-    """Extract series ticker from event ticker.
-    
-    Event tickers are like KXHIGHNY-26APR16, series is KXHIGHNY.
-    For T-suffix series: KXHIGHTSEA-26APR16 → KXHIGHTSEA
-    """
-    parts = event_ticker.split("-")
-    return parts[0] if parts else event_ticker
-
-
-def extract_city_code(event_ticker: str) -> str:
-    """Extract city code from event ticker.
-    
-    Handles both standard and T-suffix patterns:
-    - KXHIGHNY → NY (standard)
-    - KXHIGHTSEA → SEA (T-suffix)
-    - KXLOWMIA → MIA (standard)
-    - KXLOWTATL → ATL (T-suffix)
-    """
-    series = extract_series_ticker(event_ticker)
-    
-    # Check T-suffix patterns first (longer prefix)
-    if series.startswith("KXHIGHT"):
-        return series[7:]
-    elif series.startswith("KXLOWT"):
-        return series[6:]
-    # Then standard patterns
-    elif series.startswith("KXHIGH"):
-        return series[6:]
-    elif series.startswith("KXLOW"):
-        return series[5:]
-    else:
-        raise ValueError(f"Unknown event ticker format: {event_ticker}")
-
-
-def get_target_type(event_ticker: str) -> str:
-    """Get target type (HIGH or LOW) from event ticker."""
-    series = extract_series_ticker(event_ticker)
-    if series.startswith("KXHIGH"):
-        return "HIGH"
-    elif series.startswith("KXLOW"):
-        return "LOW"
-    else:
-        raise ValueError(f"Unknown event ticker format: {event_ticker}")
-
-
 def parse_ticker_date(ticker: str) -> date:
     """Extract date from Kalshi ticker.
-    
-    Format: KXHIGHNY-26APR13-B80 → 2026-04-13
+
+    Format: KXHIGHNYC-26APR13-B80 → 2026-04-13
     Date portion is YYMMMDD (e.g., 26APR13)
     """
     parts = ticker.split("-")
     if len(parts) < 2:
         raise ValueError(f"Invalid ticker format: {ticker}")
-    
+
     date_str = parts[1]  # "26APR13"
     return datetime.strptime(date_str, "%y%b%d").date()
 
 
 def parse_ticker_bin(ticker: str) -> tuple[float, bool]:
     """Extract bin value from Kalshi ticker.
-    
+
     Interior bins: B80 → (80, False)
-    Tail bins: T90 → (90, True)
-    
+    Tail bins:     T90 → (90, True)
+
     Returns (value, is_tail).
     """
     parts = ticker.split("-")
     if len(parts) < 3:
         raise ValueError(f"Invalid ticker format: {ticker}")
-    
+
     bin_part = parts[2]  # "B80" or "T90"
-    
+
     if bin_part.startswith("B"):
-        center = int(bin_part[1:])
-        return (center, False)
+        return (int(bin_part[1:]), False)
     elif bin_part.startswith("T"):
-        threshold = int(bin_part[1:])
-        return (threshold, True)
+        return (int(bin_part[1:]), True)
     else:
         raise ValueError(f"Unknown bin format: {bin_part}")
 
 
-def compute_bin_boundaries(bin_value: float, is_tail: bool,
-                           all_bins: list[tuple[float, bool]]) -> tuple[float | None, float | None]:
+def compute_bin_boundaries(
+    bin_value: float,
+    is_tail: bool,
+    all_bins: list[tuple[float, bool]],
+) -> tuple[float | None, float | None]:
     """Compute actual bin boundaries.
-    
+
     For interior bins: (value - 0.5, value + 1.5)
     For tail bins: determine if low or high tail from context.
-    
+
     Returns (lower, upper) where None represents infinity.
     """
     if not is_tail:
         return (bin_value - 0.5, bin_value + 1.5)
-    
-    # For tail bins, find if this is the lowest or highest
+
     non_tail_values = [v for v, t in all_bins if not t]
-    
+
     if not non_tail_values:
         # Only tail bins? Unusual, default to low tail
         return (None, bin_value + 0.5)
-    
+
     min_interior = min(non_tail_values)
-    max_interior = max(non_tail_values)
-    
+
     if bin_value <= min_interior:
-        # Low tail: everything below this value
         return (None, bin_value + 0.5)
+    return (bin_value - 0.5, None)
+
+
+def extract_city_code(event_ticker: str) -> str:
+    """Extract city code from event ticker.
+
+    KXHIGHNYC → NYC
+    KXLOWCHI  → CHI
+    """
+    if event_ticker.startswith("KXHIGH"):
+        return event_ticker[6:]
+    elif event_ticker.startswith("KXLOW"):
+        return event_ticker[5:]
     else:
-        # High tail: everything at/above this value
-        return (bin_value - 0.5, None)
+        raise ValueError(f"Unknown event ticker format: {event_ticker}")
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Station Matching
+# Station Matching (kept for backward compatibility — unused by the
+# per-city sync below, since station_id is known from the loop variable)
 # ─────────────────────────────────────────────────────────────────────
 
 def match_kalshi_to_station(event_ticker: str, market_title: str) -> str | None:
     """Match a Kalshi event to our internal station_id.
-    
+
     Strategy:
-    1. Extract series ticker from event ticker
-    2. Look up directly by kalshi_high_series or kalshi_low_series
-    3. Fallback: try fuzzy match on city name in title
+    1. Extract city code from event ticker
+    2. Try exact match on kalshi_city or cli_site
+    3. Try fuzzy match on city name in title
     4. Return None if no match
     """
-    from kalshicast.config.stations import get_station_by_kalshi_series, get_stations
-    
-    series = extract_series_ticker(event_ticker)
-    
-    # Try direct match on series ticker
-    station = get_station_by_kalshi_series(series)
+    from kalshicast.config.stations import get_station_by_kalshi_city, get_stations
+
+    try:
+        # event_ticker may include date suffix (e.g. "KXHIGHNYC-26APR16");
+        # extract_city_code expects the bare series prefix.
+        prefix = event_ticker.split("-")[0]
+        city_code = extract_city_code(prefix)
+    except ValueError:
+        log.warning("Could not extract city code from %s", event_ticker)
+        return None
+
+    station = get_station_by_kalshi_city(city_code)
     if station:
         return station["station_id"]
-    
-    # Fallback: fuzzy match on city name in title
+
     title_upper = market_title.upper()
     for station in get_stations():
         if station["city"].upper() in title_upper:
             return station["station_id"]
-    
+
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Main Sync Function
+# Sync — main + per-series helper
 # ─────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -179,79 +150,52 @@ class SyncResult:
     errors: int
 
 
-def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
-    """Fetch and sync all active weather markets from Kalshi.
-    
-    1. Fetch KXHIGH and KXLOW events from Kalshi API
-    2. Parse each market ticker
-    3. Match to our stations
-    4. Upsert to KALSHI_MARKETS
-    5. Create alerts for unmatched stations
-    
-    Returns SyncResult with counts.
-    """
-    from kalshicast.db.operations import (
-        upsert_kalshi_market, is_event_ignored,
-        kalshi_alert_exists, create_unknown_station_alert
-    )
-    
-    synced = 0
-    unmatched = 0
-    ignored = 0
-    errors = 0
-    
-    # Track which events we've already alerted on this run
-    alerted_events: set[str] = set()
+def _sync_one_series(
+    conn: Any,
+    client: Any,
+    station_id: str,
+    target_type: str,
+    series_ticker: str,
+) -> SyncResult:
+    """Fetch and upsert all open markets for a single (station, target_type) series.
 
-    # Fetch all open events in one call and filter client-side.
-    # Weather events use KXHIGH/KXLOW or KXHIGHT/KXLOWT prefixes.
+    Failures are isolated to this call: a raised exception is logged, counted
+    as 1 error, and returned. Other series continue.
+    """
+    from kalshicast.db.operations import upsert_kalshi_market, is_event_ignored
+
+    series_prefix = "KXHIGH" if target_type == "HIGH" else "KXLOW"
+    synced = ignored = errors = 0
+
     try:
-        all_events = client.get_events(status="open", limit=200)
+        events = client.get_events(
+            status="open",
+            series_ticker=series_ticker,
+            limit=200,
+        )
     except Exception as e:
-        log.error("Failed to fetch Kalshi events: %s", e)
+        log.warning(
+            "Kalshi: failed to fetch series %s for %s: %s",
+            series_ticker, station_id, e,
+        )
         return SyncResult(synced=0, unmatched=0, ignored=0, errors=1)
 
-    # Filter to weather events (both standard and T-suffix patterns)
-    weather_events = [
-        e for e in all_events
-        if e.get("event_ticker", "").startswith(("KXHIGH", "KXLOW"))
-    ]
-    log.info("Kalshi: fetched %d open events, %d weather (KXHIGH*/KXLOW*)",
-             len(all_events), len(weather_events))
-    if len(all_events) >= 200:
-        log.warning("Kalshi: hit limit=200 on /events; some weather events may be missing")
-
-    for event in weather_events:
+    for event in events:
         event_ticker = event.get("event_ticker", "")
 
-        # Skip ignored events
         if is_event_ignored(conn, event_ticker):
             ignored += 1
             continue
 
-        # Determine target type and series from event ticker
-        try:
-            target_type = get_target_type(event_ticker)
-            series = extract_series_ticker(event_ticker)
-        except ValueError as e:
-            log.warning("Could not parse event ticker %s: %s", event_ticker, e)
-            errors += 1
-            continue
-
-        # Match to our station
+        markets = event.get("markets", []) or []
         market_title = event.get("title", "")
-        station_id = match_kalshi_to_station(event_ticker, market_title)
 
-        # Get nested markets
-        markets = event.get("markets", [])
-
-        # Collect all bins to determine tail boundaries
+        # Pre-pass: collect all bin values to determine tail boundaries
         all_bins: list[tuple[float, bool]] = []
         for mkt in markets:
             try:
-                ticker = mkt.get("ticker", "")
-                val, is_tail = parse_ticker_bin(ticker)
-                all_bins.append((val, is_tail))
+                v, t = parse_ticker_bin(mkt.get("ticker", ""))
+                all_bins.append((v, t))
             except Exception:
                 pass
 
@@ -259,13 +203,13 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
             try:
                 ticker = mkt.get("ticker", "")
                 target_date = parse_ticker_date(ticker)
-                val, is_tail = parse_ticker_bin(ticker)
-                bin_lower, bin_upper = compute_bin_boundaries(val, is_tail, all_bins)
+                v, t = parse_ticker_bin(ticker)
+                bin_lower, bin_upper = compute_bin_boundaries(v, t, all_bins)
 
                 market_row = {
                     "ticker": ticker,
                     "event_ticker": event_ticker,
-                    "series_ticker": series,
+                    "series_ticker": series_prefix,
                     "station_id": station_id,
                     "target_date": target_date.isoformat(),
                     "target_type": target_type,
@@ -282,26 +226,88 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
                     "yes_ask": mkt.get("yes_ask"),
                     "raw": mkt,
                 }
-
                 upsert_kalshi_market(conn, market_row)
                 synced += 1
-
             except Exception as e:
-                log.warning("Failed to process market %s: %s",
-                           mkt.get("ticker", "unknown"), e)
+                log.warning(
+                    "Failed to process market %s: %s",
+                    mkt.get("ticker", "unknown"), e,
+                )
                 errors += 1
 
-        # Create alert for unmatched station (once per event)
-        if station_id is None and event_ticker not in alerted_events:
-            if not kalshi_alert_exists(conn, event_ticker):
-                sample_ticker = markets[0].get("ticker") if markets else event_ticker
-                create_unknown_station_alert(conn, event_ticker, market_title, sample_ticker)
-                log.warning("Unknown Kalshi station: %s (%s)", event_ticker, market_title)
-            alerted_events.add(event_ticker)
-            unmatched += 1
+    return SyncResult(synced=synced, unmatched=0, ignored=ignored, errors=errors)
+
+
+def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
+    """Fetch and sync all active weather markets from Kalshi.
+
+    Iterates over each configured station × {HIGH, LOW} and queries Kalshi's
+    /events endpoint with the per-city series_ticker (e.g. KXHIGHNYC,
+    KXLOWCHI). This avoids the /events 200-item cap that previously caused
+    weather events to be silently dropped when the platform had >200 open
+    events overall.
+
+    Errors in any single series are isolated and counted; other series
+    continue. After the loop, if zero markets were synced despite stations
+    being configured, a KALSHI_SYNC_EMPTY system alert is emitted (a strong
+    signal of API change, network failure, or mis-configured series scheme).
+    """
+    from kalshicast.config.stations import get_stations, get_kalshi_city
+    from kalshicast.db.operations import insert_system_alert
+
+    synced = unmatched = ignored = errors = 0
+    series_attempted = 0
+    series_failed = 0
+
+    stations = get_stations(active_only=True)
+
+    for station in stations:
+        station_id = station["station_id"]
+        kalshi_city = get_kalshi_city(station_id)
+
+        for target_type, series_prefix in (("HIGH", "KXHIGH"), ("LOW", "KXLOW")):
+            series_ticker = f"{series_prefix}{kalshi_city}"
+            series_attempted += 1
+
+            result = _sync_one_series(
+                conn, client, station_id, target_type, series_ticker,
+            )
+            synced += result.synced
+            ignored += result.ignored
+            errors += result.errors
+            if result.synced == 0 and result.errors > 0:
+                series_failed += 1
 
     conn.commit()
-    log.info("Kalshi sync complete: %d synced, %d unmatched, %d ignored, %d errors",
-             synced, unmatched, ignored, errors)
-    
-    return SyncResult(synced=synced, unmatched=unmatched, ignored=ignored, errors=errors)
+
+    log.info(
+        "Kalshi sync complete: %d synced, %d unmatched, %d ignored, %d errors "
+        "(%d series queried, %d failed)",
+        synced, unmatched, ignored, errors, series_attempted, series_failed,
+    )
+
+    # Sanity check: stations exist but nothing synced → structural failure
+    if synced == 0 and len(stations) > 0:
+        log.error(
+            "Kalshi sync returned 0 markets across %d stations — "
+            "likely API change, network failure, or invalid series scheme",
+            len(stations),
+        )
+        try:
+            insert_system_alert(conn, {
+                "alert_type": "KALSHI_SYNC_EMPTY",
+                "severity_score": 0.85,
+                "details": {
+                    "n_stations": len(stations),
+                    "series_attempted": series_attempted,
+                    "series_failed": series_failed,
+                    "errors": errors,
+                },
+            })
+            conn.commit()
+        except Exception as e:
+            log.error("Failed to emit KALSHI_SYNC_EMPTY alert: %s", e)
+
+    return SyncResult(
+        synced=synced, unmatched=unmatched, ignored=ignored, errors=errors,
+    )
