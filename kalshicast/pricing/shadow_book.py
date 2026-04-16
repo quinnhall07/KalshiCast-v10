@@ -249,7 +249,7 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
             p_win = bp["p_win"]
 
             sb_rows.append({
-                "ticker": bin_data["ticker"],  # Real Kalshi ticker!
+                "ticker": b["ticker"],  # Real Kalshi ticker
                 "station_id": station_id,
                 "target_date": target_date,
                 "target_type": target_type,

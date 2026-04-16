@@ -1331,7 +1331,7 @@ def upsert_kalshi_market(conn: Any, market: dict) -> None:
                 EVENT_TICKER = :event_ticker,
                 SERIES_TICKER = :series_ticker,
                 STATION_ID = :station_id,
-                TARGET_DATE = TO_DATE(:target_date, 'YYYY-MM-DD'),
+                TARGET_DATE = :target_date,
                 TARGET_TYPE = :target_type,
                 BIN_LOWER = :bin_lower,
                 BIN_UPPER = :bin_upper,
@@ -1353,7 +1353,7 @@ def upsert_kalshi_market(conn: Any, market: dict) -> None:
                 STATUS, LAST_PRICE, VOLUME, YES_BID, YES_ASK, RAW_JSON
             ) VALUES (
                 :ticker, :event_ticker, :series_ticker, :station_id,
-                TO_DATE(:target_date, 'YYYY-MM-DD'), :target_type, :bin_lower, :bin_upper,
+                :target_date, :target_type, :bin_lower, :bin_upper,
                 :market_title, :market_subtitle, :close_time, :settlement_time,
                 :status, :last_price, :volume, :yes_bid, :yes_ask, :raw_json
             )
@@ -1425,8 +1425,8 @@ def kalshi_alert_exists(conn: Any, event_ticker: str) -> bool:
         cur.execute("""
             SELECT 1 FROM SYSTEM_ALERTS
             WHERE ALERT_TYPE = 'UNKNOWN_KALSHI_STATION'
-              AND DETAILS LIKE :ref_pattern
-              AND STATUS = 'OPEN'
+              AND DETAILS_JSON LIKE :ref_pattern
+              AND IS_RESOLVED = 0
         """, {"ref_pattern": f'%{event_ticker}%'})
         return cur.fetchone() is not None
 
@@ -1439,14 +1439,12 @@ def create_unknown_station_alert(conn: Any, event_ticker: str,
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO SYSTEM_ALERTS (
-                ALERT_ID, ALERT_TYPE, SEVERITY, TITLE, DETAILS, STATUS, CREATED_AT
+                ALERT_ID, ALERT_TYPE, SEVERITY_SCORE, DETAILS_JSON
             ) VALUES (
-                :aid, 'UNKNOWN_KALSHI_STATION', 'WARNING',
-                :title, :details, 'OPEN', SYSTIMESTAMP
+                :aid, 'UNKNOWN_KALSHI_STATION', 0.5, :details
             )
         """, {
             "aid": str(uuid.uuid4()),
-            "title": f"Unmatched Kalshi market: {event_ticker}",
             "details": json.dumps({
                 "event_ticker": event_ticker,
                 "market_title": market_title,

@@ -59,11 +59,12 @@ class KalshiClient:
         Returns:
             List of event dicts with nested markets
         """
-        params = {
-            "status": status,
+        params: dict[str, Any] = {
             "limit": limit,
             "with_nested_markets": "true",
         }
+        if status:
+            params["status"] = status
         if series_ticker:
             params["series_ticker"] = series_ticker
         

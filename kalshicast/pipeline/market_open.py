@@ -179,10 +179,28 @@ def main() -> None:
                     conn, pipeline_run_id,
                     bankroll=1000.0,
                     target_dates=target_dates,
-                    paper_mode=False,
+                    paper_mode=True,
                 )
+
+                # Baseline fallback: if gates rejected everything, place
+                # one bet per (station, date, type) on the highest-p_win bin
+                n_selected = sum(
+                    1 for b in best_bets_paper
+                    if b.get("is_selected_for_execution")
+                )
+                if n_selected == 0:
+                    log.info("[baseline] No gate-passing bets; applying baseline fallback")
+                    baseline_bets = _create_baseline_bets(
+                        conn, pipeline_run_id, target_dates,
+                    )
+                    if baseline_bets:
+                        upsert_best_bets(conn, baseline_bets)
+                        conn.commit()
+                        log.info("[baseline] Created %d baseline bets", len(baseline_bets))
+
                 from kalshicast.pipeline.paper_sim import create_paper_positions
                 n_paper = create_paper_positions(conn, pipeline_run_id)
+                total_bets = n_paper
                 log.info("Step 7.5 OK: %d paper positions created", n_paper)
 
                 if n_paper == 0:
@@ -443,8 +461,12 @@ def _step9_evaluate_gates_ibe(
                 SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
                        sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
                        sb.TOP_MODEL_ID,
-                       sb.P_WIN AS C_VWAP_COMPUTED, 100 AS AVAILABLE_DEPTH
+                       COALESCE(km.YES_ASK / 100.0, km.LAST_PRICE / 100.0,
+                                km.YES_BID / 100.0, 0.50)
+                           AS C_VWAP_COMPUTED,
+                       100 AS AVAILABLE_DEPTH
                 FROM SHADOW_BOOK sb
+                LEFT JOIN KALSHI_MARKETS km ON km.TICKER = sb.TICKER
                 WHERE sb.PIPELINE_RUN_ID = :run_id
                   AND sb.P_WIN IS NOT NULL
             """, {"run_id": pipeline_run_id})
@@ -491,33 +513,57 @@ def _step9_evaluate_gates_ibe(
             """, {"run_id": pipeline_run_id})
             n_shadow_rows = cur.fetchone()[0] or 0
 
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    COUNT(*) AS total,
-                    SUM(CASE WHEN C_VWAP_COMPUTED > 0 AND AVAILABLE_DEPTH > 0
-                         THEN 1 ELSE 0 END) AS with_depth,
-                    SUM(CASE WHEN C_VWAP_COMPUTED = 0 OR AVAILABLE_DEPTH = 0
-                         THEN 1 ELSE 0 END) AS empty
-                FROM MARKET_ORDERBOOK_SNAPSHOTS mos
-                WHERE EXISTS (
-                    SELECT 1 FROM SHADOW_BOOK sb
-                    WHERE sb.TICKER = mos.TICKER
-                      AND sb.PIPELINE_RUN_ID = :run_id
-                )
-            """, {"run_id": pipeline_run_id})
-            snap_row = cur.fetchone()
-            n_snaps = int(snap_row[0]) if snap_row and snap_row[0] else 0
-            n_with_depth = int(snap_row[1]) if snap_row and snap_row[1] else 0
-            n_empty = int(snap_row[2]) if snap_row and snap_row[2] else 0
+        if paper_mode:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*),
+                           SUM(CASE WHEN COALESCE(YES_ASK, LAST_PRICE, YES_BID)
+                                         IS NOT NULL
+                                THEN 1 ELSE 0 END)
+                    FROM KALSHI_MARKETS km
+                    WHERE EXISTS (
+                        SELECT 1 FROM SHADOW_BOOK sb
+                        WHERE sb.TICKER = km.TICKER
+                          AND sb.PIPELINE_RUN_ID = :run_id
+                    )
+                """, {"run_id": pipeline_run_id})
+                km_row = cur.fetchone()
+                n_km = int(km_row[0]) if km_row and km_row[0] else 0
+                n_priced = int(km_row[1]) if km_row and km_row[1] else 0
+            log.warning(
+                "[gates] paper_mode: zero candidates. "
+                "shadow_book_rows=%d kalshi_markets=%d "
+                "(with_prices=%d without=%d)",
+                n_shadow_rows, n_km, n_priced, n_km - n_priced,
+            )
+        else:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN C_VWAP_COMPUTED > 0 AND AVAILABLE_DEPTH > 0
+                             THEN 1 ELSE 0 END) AS with_depth,
+                        SUM(CASE WHEN C_VWAP_COMPUTED = 0 OR AVAILABLE_DEPTH = 0
+                             THEN 1 ELSE 0 END) AS empty
+                    FROM MARKET_ORDERBOOK_SNAPSHOTS mos
+                    WHERE EXISTS (
+                        SELECT 1 FROM SHADOW_BOOK sb
+                        WHERE sb.TICKER = mos.TICKER
+                          AND sb.PIPELINE_RUN_ID = :run_id
+                    )
+                """, {"run_id": pipeline_run_id})
+                snap_row = cur.fetchone()
+                n_snaps = int(snap_row[0]) if snap_row and snap_row[0] else 0
+                n_with_depth = int(snap_row[1]) if snap_row and snap_row[1] else 0
+                n_empty = int(snap_row[2]) if snap_row and snap_row[2] else 0
 
-        log.warning(
-            "[gates] zero candidates with real market depth. "
-            "shadow_book_rows=%d orderbook_snapshots=%d "
-            "(with_depth=%d empty=%d). "
-            "All markets are either illiquid or not fetched.",
-            n_shadow_rows, n_snaps, n_with_depth, n_empty,
-        )
+            log.warning(
+                "[gates] zero candidates with real market depth. "
+                "shadow_book_rows=%d orderbook_snapshots=%d "
+                "(with_depth=%d empty=%d). "
+                "All markets are either illiquid or not fetched.",
+                n_shadow_rows, n_snaps, n_with_depth, n_empty,
+            )
         return []
 
     # Get ensemble state for spread info
@@ -778,6 +824,75 @@ def _step9_evaluate_gates_ibe(
     conn.commit()
 
     return [b for b in best_bets if b.get("is_selected_for_execution")]
+
+
+def _create_baseline_bets(conn: Any, pipeline_run_id: str, target_dates: list) -> list:
+    """Baseline fallback: pick highest-p_win bin per (station, date, type).
+
+    Used when the full gate chain rejects all candidates or when Kalshi market
+    prices are unavailable.  Places one small bet per group so the paper-sim
+    pipeline has positions to settle and grade.
+
+    Minimum criteria:
+    - p_win > 0.20 (model assigns meaningful probability)
+    - One bet per (station, date, type) group (the best bin)
+    - Fixed sizing: 1 % of $1 000 paper bankroll
+    """
+    from collections import defaultdict
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
+                   sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN,
+                   COALESCE(km.YES_ASK / 100.0, km.LAST_PRICE / 100.0,
+                            km.YES_BID / 100.0, 0.50) AS C_MARKET
+            FROM SHADOW_BOOK sb
+            LEFT JOIN KALSHI_MARKETS km ON km.TICKER = sb.TICKER
+            WHERE sb.PIPELINE_RUN_ID = :run_id
+              AND sb.P_WIN IS NOT NULL
+              AND sb.P_WIN > 0.20
+        """, {"run_id": pipeline_run_id})
+        rows = cur.fetchall()
+
+    if not rows:
+        return []
+
+    # Group by (station, date, type), pick highest p_win
+    groups: dict[str, list] = defaultdict(list)
+    for r in rows:
+        key = f"{r[1]}|{r[2]}|{r[3]}"
+        groups[key].append(r)
+
+    bets = []
+    for key, group in groups.items():
+        best = max(group, key=lambda r: float(r[6]))
+        ticker, sid, td, tt, bl, bu, p_win, c_market = best
+        p_win_f = float(p_win)
+        c_market_f = float(c_market)
+
+        bets.append({
+            "ticker": ticker,
+            "pipeline_run_id": pipeline_run_id,
+            "station_id": sid,
+            "target_date": str(td)[:10] if td else None,
+            "target_type": tt,
+            "bin_lower": float(bl) if bl is not None else None,
+            "bin_upper": float(bu) if bu is not None else None,
+            "p_win": p_win_f,
+            "contract_price": c_market_f,
+            "c_vwap": c_market_f,
+            "ev_net": (p_win_f - c_market_f) * 100,
+            "order_type": "BASELINE",
+            "f_star": 0.01,
+            "f_final": 0.01,
+            "is_selected_for_execution": True,
+            "pipeline_run_status": "OK",
+            "gate_flags": {"edge": True, "spread": True, "skill": True,
+                           "lead": True, "reserved": True},
+            "contracts": max(1, int(0.01 * 1000 / max(c_market_f, 0.01))),
+        })
+
+    return bets
 
 
 def _make_best_bet(
