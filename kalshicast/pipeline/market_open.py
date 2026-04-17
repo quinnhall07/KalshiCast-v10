@@ -161,12 +161,22 @@ def main() -> None:
         
         # Step 8: fetch_market_prices (Required for accurate paper trades AND live trades)
         if client is not None:
-            try:
-                total_snapshots = _step8_fetch_market_prices(conn, client, pipeline_run_id)
-                log.info("Step 8 OK: %d orderbook snapshots", total_snapshots)
-            except Exception as e:
-                log.error("Step 8 ERROR: market price fetch failed: %s", e)
-                status = STATUS_PARTIAL
+            if _liquidity_gate_open(now_utc):
+                try:
+                    total_snapshots = _step8_fetch_market_prices(conn, client, pipeline_run_id)
+                    log.info("Step 8 OK: %d orderbook snapshots", total_snapshots)
+                except Exception as e:
+                    log.error("Step 8 ERROR: market price fetch failed: %s", e)
+                    status = STATUS_PARTIAL
+            else:
+                start_h = get_param_int("pipeline.market_hours_start_utc")
+                end_h = get_param_int("pipeline.market_hours_end_utc")
+                log.info(
+                    "Step 8 SKIPPED: outside liquidity window (now=%02d:%02dZ, "
+                    "window=%02d:00–%02d:00Z). Kalshi weather books are typically "
+                    "empty outside this range.",
+                    now_utc.hour, now_utc.minute, start_h, end_h,
+                )
 
         # Step 7.5: create_paper_positions (paper mode only)
         if not live_mode:
@@ -368,6 +378,20 @@ def main() -> None:
 # Step helpers
 # ─────────────────────────────────────────────────────────────────────
 
+def _liquidity_gate_open(now_utc: datetime) -> bool:
+    """True if the current UTC hour is inside the configured Kalshi weather
+    liquidity window. Outside it, Kalshi weather order books are usually empty
+    across every ticker, so fetching them just wastes API quota and creates
+    phantom "all markets illiquid" alerts.
+    """
+    if not get_param_bool("pipeline.liquidity_gate_enabled", default=True):
+        return True
+    start = get_param_int("pipeline.market_hours_start_utc")
+    end = get_param_int("pipeline.market_hours_end_utc")
+    h = now_utc.hour
+    return start <= h < end
+
+
 def _step8_fetch_market_prices(conn, client, run_id: str) -> int:
     """Fetch order books for active Shadow Book tickers."""
     import time as _time
@@ -403,6 +427,8 @@ def _step8_fetch_market_prices(conn, client, run_id: str) -> int:
     count = 0
     n_with_depth = 0
     n_empty = 0
+    sample_empty: dict[str, Any] | None = None
+    sample_with_depth: dict[str, Any] | None = None
     t_start = _time.monotonic()
 
     for ticker in tickers_to_fetch:
@@ -420,8 +446,26 @@ def _step8_fetch_market_prices(conn, client, run_id: str) -> int:
             count += 1
             if depth > 0 and c_vwap > 0:
                 n_with_depth += 1
+                if sample_with_depth is None:
+                    sample_with_depth = {
+                        "ticker": ticker,
+                        "c_vwap": round(c_vwap, 4),
+                        "depth": depth,
+                        "yes_levels": len(orderbook.get("yes", []) or []),
+                        "no_levels": len(orderbook.get("no", []) or []),
+                    }
             else:
                 n_empty += 1
+                if sample_empty is None:
+                    sample_empty = {
+                        "ticker": ticker,
+                        "c_vwap": round(c_vwap, 4),
+                        "depth": depth,
+                        "yes_levels": len(orderbook.get("yes", []) or []),
+                        "no_levels": len(orderbook.get("no", []) or []),
+                        "yes_first": (orderbook.get("yes") or [None])[0],
+                        "no_first": (orderbook.get("no") or [None])[0],
+                    }
         except Exception as e:
             log.warning("Orderbook fetch failed for %s: %s", ticker, e)
 
@@ -429,6 +473,13 @@ def _step8_fetch_market_prices(conn, client, run_id: str) -> int:
     log.info("[step8] fetched %d orderbooks in %.1fs: %d with depth, %d empty, "
              "%d skipped (previously empty)",
              count, elapsed, n_with_depth, n_empty, n_skipped)
+
+    # If every fetched book is empty, show one sample so we can tell a
+    # market-closed window from a parser/schema bug.
+    if count > 0 and n_with_depth == 0 and sample_empty is not None:
+        log.warning("[step8] all %d books empty — sample: %s", count, sample_empty)
+    elif sample_with_depth is not None:
+        log.debug("[step8] sample liquid book: %s", sample_with_depth)
 
     conn.commit()
     return count
@@ -454,7 +505,11 @@ def _step9_evaluate_gates_ibe(
     from kalshicast.execution.positions import get_remaining_capacity
     from kalshicast.collection.lead_time import compute_lead_hours, classify_lead_hours
 
-    # Get Shadow Book candidates with market prices
+    # Get Shadow Book candidates with market prices.
+    # Paper mode uses KALSHI_MARKETS cached yes_ask/last/yes_bid as a proxy for
+    # c_market. It previously fell back to 0.50 when all three were NULL — but
+    # that created phantom "edges" of 0.495 against a price that doesn't exist
+    # on any real order book. We now require at least one real price field.
     with conn.cursor() as cur:
         if paper_mode:
             cur.execute("""
@@ -462,13 +517,14 @@ def _step9_evaluate_gates_ibe(
                        sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
                        sb.TOP_MODEL_ID,
                        COALESCE(km.YES_ASK / 100.0, km.LAST_PRICE / 100.0,
-                                km.YES_BID / 100.0, 0.50)
+                                km.YES_BID / 100.0)
                            AS C_VWAP_COMPUTED,
                        100 AS AVAILABLE_DEPTH
                 FROM SHADOW_BOOK sb
                 LEFT JOIN KALSHI_MARKETS km ON km.TICKER = sb.TICKER
                 WHERE sb.PIPELINE_RUN_ID = :run_id
                   AND sb.P_WIN IS NOT NULL
+                  AND COALESCE(km.YES_ASK, km.LAST_PRICE, km.YES_BID) IS NOT NULL
             """, {"run_id": pipeline_run_id})
         else:
             cur.execute("""
@@ -613,6 +669,15 @@ def _step9_evaluate_gates_ibe(
         row = cur.fetchone()
         mdd = float(row[0]) if row and row[0] else 0.0
 
+    # Kalman bias per (station, target_type) for IBE SCAS. Previously this was
+    # hardcoded to 0.0, so SCAS effectively measured |B_seasonal| instead of
+    # |B_seasonal − B_current|. That masked real seasonal drift signals.
+    kalman_b_cache: dict[str, float] = {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT STATION_ID, TARGET_TYPE, B_K FROM KALMAN_STATES")
+        for row in cur:
+            kalman_b_cache[f"{row[0]}|{row[1]}"] = float(row[2]) if row[2] is not None else 0.0
+
     # Group candidates by station/date/type for Smirnov Kelly
     from collections import defaultdict
     groups = defaultdict(list)
@@ -621,6 +686,7 @@ def _step9_evaluate_gates_ibe(
         groups[key].append(c)
 
     best_bets = []
+    sizing_skip_reasons: dict[str, int] = defaultdict(int)
 
     for group_key, group_candidates in groups.items():
         parts = group_key.split("|")
@@ -681,11 +747,21 @@ def _step9_evaluate_gates_ibe(
                 best_bets.append(_make_best_bet(cand, pipeline_run_id, selected=False))
                 continue
 
+            # Per-candidate BSS — lead_bracket can vary within a group (e.g.
+            # when a station has markets for "today's HIGH" and "tonight's
+            # LOW" close together). Previously this loop silently reused the
+            # last candidate's bss_info from the gate-evaluation loop.
+            cand_bracket = cand.get("lead_bracket", "h3")
+            cand_bss_info = bss_cache.get(
+                f"{sid}|{tt}|{cand_bracket}",
+                {"bss": None, "qualified": False},
+            )
+
             prev_sb = get_previous_shadow_book(conn, cand["ticker"])
             ibe_result = evaluate_ibe(conn, {
                 "station_id": sid,
                 "target_type": tt,
-                "lead_bracket": cand.get("lead_bracket", "h3"),
+                "lead_bracket": cand_bracket,
                 "target_date": td,
                 "p_win": cand["p_win"],
                 "p_previous": prev_sb["p_win"] if prev_sb else None,
@@ -695,7 +771,7 @@ def _step9_evaluate_gates_ibe(
                 "s_tk": ens["s_tk"],
                 "s_previous": None,
                 "sigma_hist": ens["sigma_eff"],
-                "b_k": 0.0,
+                "b_k": kalman_b_cache.get(f"{sid}|{tt}", 0.0),
             })
 
             insert_ibe_signal_log(conn, {
@@ -720,16 +796,20 @@ def _step9_evaluate_gates_ibe(
 
             sizing = full_sizing_chain(
                 f_star=f_star,
-                bss=bss_info["bss"] or 0.0,
+                bss=cand_bss_info["bss"] or 0.0,
                 ibe_composite=ibe_result["composite"],
                 gamma_scale=gamma_scale,
                 mdd=mdd,
                 bankroll=bankroll,
                 remaining_capacity=remaining,
                 c_market=cand["c_market"],
+                ticker=cand["ticker"],
             )
 
             selected = not sizing.get("skip", True) and sizing.get("contracts", 0) > 0
+
+            if sizing.get("skip"):
+                sizing_skip_reasons[sizing.get("reason", "unknown")] += 1
 
             bet = _make_best_bet(
                 cand, pipeline_run_id, selected=selected,
@@ -740,13 +820,18 @@ def _step9_evaluate_gates_ibe(
                 d_scale=sizing.get("d_scale", 1.0),
                 gamma=gamma,
                 contracts=sizing.get("contracts", 0),
+                sizing_reason=sizing.get("reason"),
             )
             best_bets.append(bet)
 
-        # Non-passing candidates
+        # Non-passing candidates in mixed-pass groups still need BEST_BETS
+        # rows so the dashboard / diagnostics see a full candidate picture.
+        # Previously this loop was a no-op (continue on match).
         for cand in group_candidates:
             if not cand.get("gate_pass"):
-                continue  # Already added above
+                best_bets.append(
+                    _make_best_bet(cand, pipeline_run_id, selected=False)
+                )
 
     # ── Diagnostic logging: candidate elimination funnel ─────────────
     n_candidates_total = len(candidates)
@@ -778,6 +863,12 @@ def _step9_evaluate_gates_ibe(
         n_all_gates_pass, n_kelly_positive, n_ibe_veto, n_selected,
         avg_edge, max_edge,
     )
+
+    if sizing_skip_reasons:
+        log.info(
+            "[gates] sizing-chain skip reasons: %s",
+            dict(sizing_skip_reasons),
+        )
 
     # Top 5 candidates by edge for diagnostics
     if candidates:
@@ -841,20 +932,46 @@ def _create_baseline_bets(conn: Any, pipeline_run_id: str, target_dates: list) -
     from collections import defaultdict
 
     with conn.cursor() as cur:
+        # Refuse the historical 0.50 fallback. A baseline bet priced at
+        # an invented 50¢ creates grading noise that poisons BSS for the
+        # cell. Require a real Kalshi price field.
         cur.execute("""
             SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
                    sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN,
                    COALESCE(km.YES_ASK / 100.0, km.LAST_PRICE / 100.0,
-                            km.YES_BID / 100.0, 0.50) AS C_MARKET
+                            km.YES_BID / 100.0) AS C_MARKET
             FROM SHADOW_BOOK sb
             LEFT JOIN KALSHI_MARKETS km ON km.TICKER = sb.TICKER
             WHERE sb.PIPELINE_RUN_ID = :run_id
               AND sb.P_WIN IS NOT NULL
               AND sb.P_WIN > 0.20
+              AND COALESCE(km.YES_ASK, km.LAST_PRICE, km.YES_BID) IS NOT NULL
         """, {"run_id": pipeline_run_id})
         rows = cur.fetchall()
 
+    # Coverage diagnostics: how many groups exist in SHADOW_BOOK total vs.
+    # how many survived the p_win > 0.20 filter?
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(DISTINCT STATION_ID || '|' || TARGET_DATE || '|' || TARGET_TYPE)
+            FROM SHADOW_BOOK
+            WHERE PIPELINE_RUN_ID = :run_id AND P_WIN IS NOT NULL
+        """, {"run_id": pipeline_run_id})
+        total_groups = int(cur.fetchone()[0] or 0)
+
+    groups_passing_filter = len({f"{r[1]}|{r[2]}|{r[3]}" for r in rows})
+
+    log.info(
+        "[baseline] shadow_book groups=%d, survived p_win>0.20=%d, "
+        "excluded=%d (all bins had p_win ≤ 0.20)",
+        total_groups, groups_passing_filter,
+        total_groups - groups_passing_filter,
+    )
+
     if not rows:
+        log.warning(
+            "[baseline] zero rows matched p_win>0.20 — no baseline bets placed"
+        )
         return []
 
     # Group by (station, date, type), pick highest p_win
@@ -869,6 +986,12 @@ def _create_baseline_bets(conn: Any, pipeline_run_id: str, target_dates: list) -
         ticker, sid, td, tt, bl, bu, p_win, c_market = best
         p_win_f = float(p_win)
         c_market_f = float(c_market)
+
+        log.debug(
+            "[baseline] %s %s %s → ticker=%s p_win=%.4f c_market=%.4f "
+            "(%d bins in group)",
+            sid, td, tt, ticker, p_win_f, c_market_f, len(group),
+        )
 
         bets.append({
             "ticker": ticker,
@@ -907,6 +1030,7 @@ def _make_best_bet(
     d_scale: float = 1.0,
     gamma: float = 1.0,
     contracts: int = 0,
+    sizing_reason: str | None = None,
 ) -> dict:
     """Build a BEST_BETS row dict."""
     return {
@@ -932,6 +1056,7 @@ def _make_best_bet(
         "pipeline_run_status": "OK",
         "gate_flags": cand.get("gate_flags"),
         "contracts": contracts,
+        "sizing_reason": sizing_reason,
         # Pass through for order execution
         "s_tk": cand.get("s_tk"),
         "lead_hours": cand.get("lead_hours", 24.0),
@@ -941,8 +1066,31 @@ def _make_best_bet(
 def _step11_update_health(conn: Any, target_dates: list[str],
                           total_ensemble: int, total_shadow: int,
                           total_bets: int) -> None:
-    """Update PIPELINE_DAY_HEALTH for each target date."""
+    """Update PIPELINE_DAY_HEALTH for each target date.
+
+    Uses per-date ENSEMBLE_STATE / BEST_BETS counts rather than pipeline
+    totals, so each row reflects the work actually done for that date
+    (previously every row received the 4-day sum, inflating the dashboard).
+    """
     for td in target_dates:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(DISTINCT STATION_ID)
+                FROM ENSEMBLE_STATE
+                WHERE TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD')
+            """, {"td": td})
+            row = cur.fetchone()
+            per_date_forecasted = int(row[0]) if row and row[0] else 0
+
+            cur.execute("""
+                SELECT COUNT(DISTINCT STATION_ID)
+                FROM BEST_BETS
+                WHERE TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD')
+                  AND IS_SELECTED_FOR_EXECUTION = 1
+            """, {"td": td})
+            row = cur.fetchone()
+            per_date_scored = int(row[0]) if row and row[0] else 0
+
         with conn.cursor() as cur:
             cur.execute("""
                 MERGE INTO PIPELINE_DAY_HEALTH tgt USING DUAL
@@ -958,7 +1106,7 @@ def _step11_update_health(conn: Any, target_dates: list[str],
                     TO_DATE(:td, 'YYYY-MM-DD'), SYSTIMESTAMP, :sf, :ss,
                     CASE WHEN :sf > 0 THEN 1 ELSE 0 END
                 )
-            """, {"td": td, "sf": total_ensemble, "ss": total_bets})
+            """, {"td": td, "sf": per_date_forecasted, "ss": per_date_scored})
     conn.commit()
 
 

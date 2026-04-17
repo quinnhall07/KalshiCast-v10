@@ -166,6 +166,8 @@ def full_sizing_chain(
     bankroll: float,
     remaining_capacity: float,
     c_market: float,
+    *,
+    ticker: str | None = None,
 ) -> dict:
     """Apply the 8-step sizing chain from raw Kelly fraction to final contracts.
 
@@ -178,50 +180,95 @@ def full_sizing_chain(
     6. Drawdown scale
     7. Jitter
     8. Minimum check + round to contracts
+
+    Optional ``ticker`` is echoed into DEBUG-level trace lines so the reason a
+    bet shrinks to zero can be reconstructed without re-instrumenting.
     """
     fraction_cap = get_param_float("kelly.fraction_cap")
     min_bet_frac = get_param_float("kelly.min_bet_fraction")
     jitter_pct = get_param_float("kelly.jitter_pct")
 
+    tag = f"[sizing {ticker}]" if ticker else "[sizing]"
+    trace = log.isEnabledFor(logging.DEBUG)
+
     # Step 1: Kelly cap
     f = min(f_star, fraction_cap)
+    if trace:
+        log.debug("%s f_star=%.6f → cap(%.3f)=%.6f", tag, f_star, fraction_cap, f)
 
     # Step 2: Φ(BSS) scaling
     phi = compute_phi_bss(bss)
     f *= phi
+    if trace:
+        log.debug("%s × Φ(%.4f @ bss=%.4f) = %.6f", tag, phi, bss, f)
 
     # Step 3: IBE scaling
     f *= ibe_composite
+    if trace:
+        log.debug("%s × IBE(%.4f) = %.6f", tag, ibe_composite, f)
 
     # Step 4: Market convergence
     f *= gamma_scale
+    if trace:
+        log.debug("%s × γ(%.4f) = %.6f", tag, gamma_scale, f)
 
     # Step 5: Position cap
+    f_before_cap = f
     f = min(f, remaining_capacity)
+    if trace:
+        log.debug(
+            "%s ∧ remaining_capacity(%.6f) = %.6f%s",
+            tag, remaining_capacity, f,
+            " (capped)" if f < f_before_cap else "",
+        )
 
     # Step 6: Drawdown scale
     d_scale = compute_drawdown_scale(mdd)
     f *= d_scale
+    if trace:
+        log.debug("%s × D_scale(%.4f @ mdd=%.4f) = %.6f", tag, d_scale, mdd, f)
 
     # Step 7: Jitter
     jitter = 1.0 + random.uniform(-jitter_pct, jitter_pct)
     f *= jitter
+    if trace:
+        log.debug("%s × jitter(%.4f) = %.6f", tag, jitter, f)
 
     # Step 8: Minimum check + round
     if f < min_bet_frac:
+        if trace:
+            log.debug(
+                "%s SKIP below_minimum: f=%.6f < min_bet_frac=%.4f",
+                tag, f, min_bet_frac,
+            )
         return {
             "f_final": 0.0, "contracts": 0, "skip": True,
             "reason": "below_minimum", "d_scale": d_scale, "phi": phi,
+            "f_before_min": round(f, 6),
+            "min_bet_frac": min_bet_frac,
         }
 
     dollar_amount = f * bankroll
     contracts = int(dollar_amount / max(c_market, 0.01))
 
     if contracts < 1:
+        if trace:
+            log.debug(
+                "%s SKIP below_one_contract: dollar=%.4f / c_market=%.4f < 1",
+                tag, dollar_amount, c_market,
+            )
         return {
             "f_final": 0.0, "contracts": 0, "skip": True,
             "reason": "below_one_contract", "d_scale": d_scale, "phi": phi,
+            "f_before_min": round(f, 6),
+            "dollar_amount": round(dollar_amount, 4),
         }
+
+    if trace:
+        log.debug(
+            "%s OK f_final=%.6f contracts=%d dollar=%.2f",
+            tag, f, contracts, dollar_amount,
+        )
 
     return {
         "f_star": round(f_star, 6),

@@ -472,20 +472,42 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
                 f"{station_id}|{top_model}|{target_type}|{lb}", [])
             g1_s = compute_skewness(err_vals)
 
-            # Regime-aware sigma inflation when bimodal detected
+            # Regime-aware σ handling when bimodal detected. Kept as a safety
+            # net for extreme splits that the skew-normal alone can't absorb;
+            # shadow_book.price_shadow_book also re-detects bimodal and, when
+            # the split is tractable, routes pricing through the §6.5
+            # mixture-of-normals path so the centroid separation is modelled
+            # directly instead of hidden inside σ.
             bimodal = detect_bimodal(fc_values, s_unweighted)
             if bimodal is not None:
                 centroid_dist = bimodal["centroid_distance"]
-                sigma_adj = max(sigma_adj, centroid_dist / 2.0)
-                log.info("[ensemble] %s/%s bimodal: inflating sigma_adj to %.2f",
-                         station_id, target_type, sigma_adj)
+                sigma_inflation_cap = get_param_float("regime.sigma_inflation_cap")
+                target_sigma = max(sigma_adj, centroid_dist / 2.0)
+                if target_sigma > sigma_inflation_cap:
+                    log.warning(
+                        "[ensemble] %s/%s bimodal: centroid_dist=%.1f → "
+                        "sigma_adj=%.2f exceeds cap=%.2f; clamping",
+                        station_id, target_type, centroid_dist,
+                        target_sigma, sigma_inflation_cap,
+                    )
+                    sigma_adj = sigma_inflation_cap
+                else:
+                    sigma_adj = target_sigma
+                    log.info(
+                        "[ensemble] %s/%s bimodal: inflating sigma_adj to %.2f",
+                        station_id, target_type, sigma_adj,
+                    )
 
             # σ_eff
             sigma_eff = compute_sigma_eff(sigma_adj, s_weighted)
 
-            # Kalman-corrected μ
+            # Kalman-corrected μ per spec §5.6: μ = F_top + B_k, where B_k is
+            # the estimated bias added back to the forecast (residual
+            # convention is F_top + B_k − O, so B_k > 0 when observation runs
+            # hotter than forecast). Previously this subtracted B_k, which
+            # silently applied the bias in the wrong direction.
             b_k = ks["b_k"] if ks else 0.0
-            mu = f_top - b_k  # bias correction: μ = f_top - B_k (B_k tracks forecast-observed)
+            mu = f_top + b_k
 
             # Build rows
             weight_json = {s: round(w, 6) for s, w in zip(source_ids, weights)}

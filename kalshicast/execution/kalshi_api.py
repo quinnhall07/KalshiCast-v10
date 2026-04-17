@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any
 from urllib.parse import urlparse
@@ -23,6 +24,37 @@ from kalshicast.config.params_bootstrap import get_param_int, get_param_float
 log = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+
+class _TokenBucket:
+    """Simple thread-safe token bucket rate limiter.
+
+    Refills at ``rate`` tokens/sec up to ``capacity``. ``acquire`` sleeps
+    just long enough for one token to become available. Used to keep the
+    Kalshi client under the per-minute limit without relying on 429 retries.
+    """
+
+    def __init__(self, rate: float, capacity: float) -> None:
+        self.rate = max(rate, 0.1)
+        self.capacity = max(capacity, 1.0)
+        self._tokens = self.capacity
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(
+                    self.capacity,
+                    self._tokens + (now - self._last) * self.rate,
+                )
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self.rate
+            time.sleep(wait)
 
 
 class KalshiClient:
@@ -46,6 +78,10 @@ class KalshiClient:
 
         self._session = requests.Session()
         self._session.headers["Content-Type"] = "application/json"
+
+        rate = get_param_float("api.kalshi_rate_limit_per_sec")
+        burst = float(get_param_int("api.kalshi_rate_limit_burst"))
+        self._rate_limiter = _TokenBucket(rate=rate, capacity=burst)
 
     def get_events(self, *, status: str = "open", series_ticker: str | None = None,
                    limit: int = 100) -> list[dict]:
@@ -117,6 +153,7 @@ class KalshiClient:
 
         last_exc: Exception | None = None
         for attempt in range(1, retry_max + 1):
+            self._rate_limiter.acquire()
             auth_headers = self._sign_headers(method, parsed_path)
             try:
                 resp = self._session.request(

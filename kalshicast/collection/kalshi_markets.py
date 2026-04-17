@@ -37,23 +37,24 @@ def parse_ticker_date(ticker: str) -> date:
 
 
 def parse_ticker_bin(ticker: str) -> tuple[float, bool]:
-    """Extract bin value from Kalshi ticker.
+    """Extract bin value from Kalshi ticker (fallback parser).
 
-    Interior bins: B80 → (80, False)
-    Tail bins:     T90 → (90, True)
+    Interior bins: B80 → (80.0, False), B77.5 → (77.5, False)
+    Tail bins:     T90 → (90.0, True)
 
-    Returns (value, is_tail).
+    Returns (value, is_tail). Values are floats — modern Kalshi tickers use
+    half-integer boundaries (e.g. B77.5) for 2°F-wide bins.
     """
     parts = ticker.split("-")
     if len(parts) < 3:
         raise ValueError(f"Invalid ticker format: {ticker}")
 
-    bin_part = parts[2]  # "B80" or "T90"
+    bin_part = parts[2]  # "B80", "B77.5", or "T90"
 
     if bin_part.startswith("B"):
-        return (int(bin_part[1:]), False)
+        return (float(bin_part[1:]), False)
     elif bin_part.startswith("T"):
-        return (int(bin_part[1:]), True)
+        return (float(bin_part[1:]), True)
     else:
         raise ValueError(f"Unknown bin format: {bin_part}")
 
@@ -63,27 +64,94 @@ def compute_bin_boundaries(
     is_tail: bool,
     all_bins: list[tuple[float, bool]],
 ) -> tuple[float | None, float | None]:
-    """Compute actual bin boundaries.
+    """Compute bin boundaries from ticker values (fallback path).
 
-    For interior bins: (value - 0.5, value + 1.5)
-    For tail bins: determine if low or high tail from context.
+    Preferred path is to use ``floor_strike``/``cap_strike`` from the Kalshi
+    market payload via :func:`extract_boundaries_from_market`. This helper is
+    only used when those fields are missing.
 
-    Returns (lower, upper) where None represents infinity.
+    Heuristics:
+    * Interior bins whose label is a half-integer (e.g. ``B77.5``) → the label
+      is already the lower boundary; width comes from the gap to the next
+      interior value (defaulting to 2°F).
+    * Interior bins whose label is an integer (legacy format, e.g. ``B80``) →
+      ``(value - 0.5, value + 1.5)``.
+    * Tail bins fill the space outside the interior bin range.
     """
+    interior_values = sorted(v for v, t in all_bins if not t)
+
+    def _is_half(x: float) -> bool:
+        return abs(x - round(x)) > 1e-6
+
     if not is_tail:
+        if _is_half(bin_value):
+            width = 2.0
+            if len(interior_values) >= 2:
+                diffs = [
+                    b - a for a, b in zip(interior_values, interior_values[1:])
+                    if b - a > 0
+                ]
+                if diffs:
+                    width = min(diffs)
+            return (bin_value, bin_value + width)
         return (bin_value - 0.5, bin_value + 1.5)
 
-    non_tail_values = [v for v, t in all_bins if not t]
-
-    if not non_tail_values:
-        # Only tail bins? Unusual, default to low tail
+    if not interior_values:
         return (None, bin_value + 0.5)
 
-    min_interior = min(non_tail_values)
+    min_interior = min(interior_values)
+    max_interior = max(interior_values)
 
     if bin_value <= min_interior:
-        return (None, bin_value + 0.5)
+        return (None, min_interior if _is_half(min_interior) else bin_value + 0.5)
+
+    if _is_half(max_interior):
+        width = 2.0
+        if len(interior_values) >= 2:
+            diffs = [
+                b - a for a, b in zip(interior_values, interior_values[1:])
+                if b - a > 0
+            ]
+            if diffs:
+                width = min(diffs)
+        return (max_interior + width, None)
     return (bin_value - 0.5, None)
+
+
+def extract_boundaries_from_market(
+    mkt: dict,
+) -> tuple[float | None, float | None] | None:
+    """Read bin boundaries from Kalshi's ``strike_type``/``floor``/``cap`` fields.
+
+    Returns ``(bin_lower, bin_upper)`` with ``None`` for ±∞, or ``None`` if the
+    payload lacks the fields. This is the preferred path — ticker-name parsing
+    is only used when the payload doesn't carry strike fields.
+
+    Kalshi weather settlement uses integer °F observed at the CLI station, so
+    the integer ``floor``/``cap`` from the payload represents an inclusive
+    integer range. We widen each bound by 0.5°F so adjacent bins share a
+    boundary at X.5 — otherwise CDF(cap) − CDF(floor) loses the half-degree
+    "dead zone" between consecutive bins (e.g. 76↔77) and P(win) over all
+    bins sums to ~0.6 instead of ~1.0.
+
+    Example: a "75–76" bin (``strike_type=between, floor=75, cap=76``) means
+    integer HIGH ∈ {75, 76}, which maps to continuous ``[74.5, 76.5)``.
+    """
+    strike_type = (mkt.get("strike_type") or "").lower()
+    floor = mkt.get("floor_strike")
+    cap = mkt.get("cap_strike")
+
+    if strike_type == "between" and floor is not None and cap is not None:
+        return (float(floor) - 0.5, float(cap) + 0.5)
+    if strike_type == "less" or (strike_type == "" and cap is not None and floor is None):
+        return (None, float(cap) + 0.5) if cap is not None else None
+    if strike_type in ("greater", "greater_or_equal") or (
+        strike_type == "" and floor is not None and cap is None
+    ):
+        return (float(floor) - 0.5, None) if floor is not None else None
+    if floor is not None and cap is not None:
+        return (float(floor) - 0.5, float(cap) + 0.5)
+    return None
 
 
 def extract_city_code(event_ticker: str) -> str:
@@ -162,10 +230,11 @@ def _sync_one_series(
     Failures are isolated to this call: a raised exception is logged, counted
     as 1 error, and returned. Other series continue.
     """
+    from kalshicast.db.connection import to_dt
     from kalshicast.db.operations import upsert_kalshi_market, is_event_ignored
 
-    series_prefix = "KXHIGH" if target_type == "HIGH" else "KXLOW"
     synced = ignored = errors = 0
+    n_markets_seen = 0
 
     try:
         events = client.get_events(
@@ -175,10 +244,20 @@ def _sync_one_series(
         )
     except Exception as e:
         log.warning(
-            "Kalshi: failed to fetch series %s for %s: %s",
-            series_ticker, station_id, e,
+            "[kalshi_sync] %s %s series=%s FETCH FAILED: %s",
+            station_id, target_type, series_ticker, e,
         )
         return SyncResult(synced=0, unmatched=0, ignored=0, errors=1)
+
+    n_events = len(events)
+
+    def _maybe_dt(value):
+        if value is None or value == "":
+            return None
+        try:
+            return to_dt(value)
+        except Exception:
+            return None
 
     for event in events:
         event_ticker = event.get("event_ticker", "")
@@ -189,6 +268,7 @@ def _sync_one_series(
 
         markets = event.get("markets", []) or []
         market_title = event.get("title", "")
+        n_markets_seen += len(markets)
 
         # Pre-pass: collect all bin values to determine tail boundaries
         all_bins: list[tuple[float, bool]] = []
@@ -203,22 +283,30 @@ def _sync_one_series(
             try:
                 ticker = mkt.get("ticker", "")
                 target_date = parse_ticker_date(ticker)
-                v, t = parse_ticker_bin(ticker)
-                bin_lower, bin_upper = compute_bin_boundaries(v, t, all_bins)
+
+                # Prefer Kalshi's strike metadata; fall back to ticker parsing.
+                bin_lower: float | None
+                bin_upper: float | None
+                boundaries = extract_boundaries_from_market(mkt)
+                if boundaries is not None:
+                    bin_lower, bin_upper = boundaries
+                else:
+                    v, t = parse_ticker_bin(ticker)
+                    bin_lower, bin_upper = compute_bin_boundaries(v, t, all_bins)
 
                 market_row = {
                     "ticker": ticker,
                     "event_ticker": event_ticker,
-                    "series_ticker": series_prefix,
+                    "series_ticker": series_ticker,
                     "station_id": station_id,
-                    "target_date": target_date.isoformat(),
+                    "target_date": target_date,
                     "target_type": target_type,
                     "bin_lower": bin_lower,
                     "bin_upper": bin_upper,
                     "market_title": market_title,
                     "market_subtitle": mkt.get("subtitle"),
-                    "close_time": mkt.get("close_time"),
-                    "settlement_time": mkt.get("settlement_time"),
+                    "close_time": _maybe_dt(mkt.get("close_time")),
+                    "settlement_time": _maybe_dt(mkt.get("settlement_time")),
                     "status": mkt.get("status"),
                     "last_price": mkt.get("last_price"),
                     "volume": mkt.get("volume"),
@@ -234,6 +322,13 @@ def _sync_one_series(
                     mkt.get("ticker", "unknown"), e,
                 )
                 errors += 1
+
+    level = log.info if synced > 0 else log.warning
+    level(
+        "[kalshi_sync] %s %s series=%s events=%d markets_seen=%d synced=%d ignored=%d errors=%d",
+        station_id, target_type, series_ticker,
+        n_events, n_markets_seen, synced, ignored, errors,
+    )
 
     return SyncResult(synced=synced, unmatched=0, ignored=ignored, errors=errors)
 
@@ -252,22 +347,40 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
     being configured, a KALSHI_SYNC_EMPTY system alert is emitted (a strong
     signal of API change, network failure, or mis-configured series scheme).
     """
-    from kalshicast.config.stations import get_stations, get_kalshi_city
+    from kalshicast.config.stations import get_stations
     from kalshicast.db.operations import insert_system_alert
 
     synced = unmatched = ignored = errors = 0
     series_attempted = 0
     series_failed = 0
+    series_empty = 0
+    series_queried: list[str] = []
 
     stations = get_stations(active_only=True)
 
     for station in stations:
         station_id = station["station_id"]
-        kalshi_city = get_kalshi_city(station_id)
 
-        for target_type, series_prefix in (("HIGH", "KXHIGH"), ("LOW", "KXLOW")):
-            series_ticker = f"{series_prefix}{kalshi_city}"
+        # Use the series tickers configured per-station. These may use either
+        # the plain prefix (KXHIGH/KXLOW) or the "T" variant (KXHIGHT/KXLOWT),
+        # and the city portion is not always the cli_site (e.g. KMSY → NOLA,
+        # KLAS → LV, KDCA → DC). Reconstructing from a hardcoded prefix +
+        # cli_site silently fails for any station that doesn't match that
+        # convention — which is 13 of 20 today.
+        for target_type, config_key in (
+            ("HIGH", "kalshi_high_series"),
+            ("LOW", "kalshi_low_series"),
+        ):
+            series_ticker = station.get(config_key)
+            if not series_ticker:
+                log.warning(
+                    "[kalshi_sync] %s %s has no %s configured — skipping",
+                    station_id, target_type, config_key,
+                )
+                continue
+
             series_attempted += 1
+            series_queried.append(series_ticker)
 
             result = _sync_one_series(
                 conn, client, station_id, target_type, series_ticker,
@@ -275,23 +388,27 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
             synced += result.synced
             ignored += result.ignored
             errors += result.errors
-            if result.synced == 0 and result.errors > 0:
+            if result.errors > 0 and result.synced == 0:
                 series_failed += 1
+            elif result.synced == 0:
+                series_empty += 1
 
     conn.commit()
 
     log.info(
         "Kalshi sync complete: %d synced, %d unmatched, %d ignored, %d errors "
-        "(%d series queried, %d failed)",
-        synced, unmatched, ignored, errors, series_attempted, series_failed,
+        "(%d series queried, %d fetch-failed, %d returned zero markets)",
+        synced, unmatched, ignored, errors,
+        series_attempted, series_failed, series_empty,
     )
 
     # Sanity check: stations exist but nothing synced → structural failure
     if synced == 0 and len(stations) > 0:
         log.error(
             "Kalshi sync returned 0 markets across %d stations — "
-            "likely API change, network failure, or invalid series scheme",
-            len(stations),
+            "likely API change, network failure, or invalid series scheme. "
+            "Series queried: %s",
+            len(stations), series_queried,
         )
         try:
             insert_system_alert(conn, {
@@ -301,6 +418,8 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
                     "n_stations": len(stations),
                     "series_attempted": series_attempted,
                     "series_failed": series_failed,
+                    "series_empty": series_empty,
+                    "series_queried": series_queried,
                     "errors": errors,
                 },
             })

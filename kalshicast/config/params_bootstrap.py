@@ -32,6 +32,13 @@ PARAM_DEFS: list[ParamDef] = [
     ParamDef("pipeline.health_heartbeat_sec", "300", "int", "Health check interval"),
     ParamDef("pipeline.max_workers", "10", "int", "ThreadPoolExecutor worker count"),
     ParamDef("pipeline.forecast_days", "4", "int", "Days of forecast to collect per run"),
+    ParamDef("pipeline.market_hours_start_utc", "14", "int", "UTC hour at/after which Kalshi weather books are expected to be liquid"),
+    ParamDef("pipeline.market_hours_end_utc", "23", "int", "UTC hour before which Kalshi weather books are expected to be liquid (exclusive)"),
+    ParamDef("pipeline.liquidity_gate_enabled", "1", "int", "If 1, skip step 8 orderbook fetch outside market hours"),
+
+    # --- API Rate Limiting ---
+    ParamDef("api.kalshi_rate_limit_per_sec", "5.0", "float", "Client-side token-bucket refill rate for Kalshi API"),
+    ParamDef("api.kalshi_rate_limit_burst", "10", "int", "Token-bucket burst capacity for Kalshi API"),
 
     # --- Lead Time Brackets ---
     ParamDef("lead.h1_max", "12.0", "float", "h1: [0, h1_max) hours"),
@@ -85,6 +92,7 @@ PARAM_DEFS: list[ParamDef] = [
     ParamDef("regime.bimodal_iqr_threshold", "1.35", "float", "IQR/S threshold to trigger bimodal detection"),
     ParamDef("regime.min_centroid_dist", "1.5", "float", "Min centroid distance as multiple of S"),
     ParamDef("regime.min_cluster_frac", "0.15", "float", "Min fraction of smaller cluster"),
+    ParamDef("regime.sigma_inflation_cap", "6.0", "float", "Max sigma_adj after bimodal inflation (F); above this skip pricing"),
 
     # --- Sigma and Skewness (L2) ---
     ParamDef("sigma.m_prior", "20", "int", "Bayesian shrinkage prior weight"),
@@ -97,6 +105,8 @@ PARAM_DEFS: list[ParamDef] = [
     ParamDef("pricing.p_min_floor", "0.001", "float", "P(win) floor to prevent log(0)"),
     ParamDef("pricing.bimodal_iqr_threshold", "1.35", "float", "Trigger bimodal when IQR/S > threshold"),
     ParamDef("pricing.bimodal_centroid_min", "1.0", "float", "Confirm bimodal if centroid dist > factor * S"),
+    ParamDef("pricing.pwin_sum_min", "0.85", "float", "Skip group if P(win) over all bins < this (mass outside Kalshi bins)"),
+    ParamDef("pricing.pwin_sum_max", "1.15", "float", "Skip group if P(win) over all bins > this"),
 
     # --- METAR Truncation (L3) ---
     ParamDef("metar.truncation_enabled", "1", "int", "Master switch for intraday truncation"),
