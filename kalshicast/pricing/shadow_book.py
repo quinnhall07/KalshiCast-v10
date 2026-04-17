@@ -209,6 +209,12 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
 
     sb_rows = []
     history_rows = []
+    n_skipped_mass_outside = 0
+    n_skipped_no_bins = 0
+    n_groups_processed = 0
+
+    pwin_sum_min = get_param_float("pricing.pwin_sum_min")
+    pwin_sum_max = get_param_float("pricing.pwin_sum_max")
 
     # 4. Process all rows in memory (Zero DB calls inside this loop!)
     for er in ensemble_rows:
@@ -220,6 +226,8 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
 
         if f_top is None:
             continue
+
+        n_groups_processed += 1
 
         # Get Kalman bias correction from local cache
         ks_key = f"{station_id}|{target_type}"
@@ -242,12 +250,34 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
         if not bins:
             log.debug("No Kalshi markets for %s/%s/%s - skipping",
                     station_id, target_date, target_type)
+            n_skipped_no_bins += 1
             continue
 
         # Compute P(win) for each bin
         probs = [compute_p_win(b["bin_lower"], b["bin_upper"], xi_s, omega_s, alpha_s) for b in bins]
 
-        # Normalize
+        # Sanity check: total probability mass across Kalshi's listed bins.
+        # If the skew-normal places too much mass outside this range (or the
+        # Kalshi bin list is incomplete), forcibly renormalizing the remainder
+        # to 1.0 creates phantom edges. Skip pricing this group instead.
+        pre_norm_sum = sum(probs)
+        n_tails = sum(
+            1 for b in bins
+            if math.isinf(b["bin_lower"]) or math.isinf(b["bin_upper"])
+        )
+        if pre_norm_sum < pwin_sum_min or pre_norm_sum > pwin_sum_max:
+            log.warning(
+                "[shadow_book] skipping %s/%s/%s: P(win) sum=%.4f outside "
+                "[%.2f, %.2f] (bins=%d incl %d tails, mu=%.2f sigma_eff=%.2f) "
+                "— model mass doesn't fit Kalshi's bin range",
+                station_id, target_date, target_type,
+                pre_norm_sum, pwin_sum_min, pwin_sum_max,
+                len(bins), n_tails, mu, sigma_eff,
+            )
+            n_skipped_mass_outside += 1
+            continue
+
+        # Normalize (residual deviation ≤ pwin_sum_{min,max})
         probs = normalize_probabilities(
             probs,
             context=f"{station_id}|{target_date}|{target_type}",
@@ -301,5 +331,18 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
         insert_shadow_book_history(conn, history_rows)
 
     conn.commit()
-    log.info("[shadow_book] wrote %d rows for %s", wrote, target_date)
+    if wrote == 0 and n_skipped_no_bins == n_groups_processed and n_groups_processed > 0:
+        log.info(
+            "[shadow_book] %s: no Kalshi markets listed yet for any of %d "
+            "ensemble groups — Kalshi typically lists weather markets "
+            "24–48h ahead of expiry, so future-dated runs will often return 0 rows.",
+            target_date, n_groups_processed,
+        )
+    else:
+        log.info(
+            "[shadow_book] wrote %d rows for %s "
+            "(processed=%d, skipped_no_bins=%d, skipped_mass_outside=%d)",
+            wrote, target_date,
+            n_groups_processed, n_skipped_no_bins, n_skipped_mass_outside,
+        )
     return wrote

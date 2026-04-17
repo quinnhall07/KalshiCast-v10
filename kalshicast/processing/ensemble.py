@@ -472,13 +472,32 @@ def compute_ensemble_state(conn: Any, target_date: str, run_id: str) -> int:
                 f"{station_id}|{top_model}|{target_type}|{lb}", [])
             g1_s = compute_skewness(err_vals)
 
-            # Regime-aware sigma inflation when bimodal detected
+            # Regime-aware sigma inflation when bimodal detected.
+            # Cap the inflated σ so a wide split doesn't blow up the skew-normal
+            # tails (which previously pushed probability mass outside Kalshi's
+            # interior bins and forced a 0.6→1.0 renormalization).
             bimodal = detect_bimodal(fc_values, s_unweighted)
+            bimodal_suppress = False
             if bimodal is not None:
                 centroid_dist = bimodal["centroid_distance"]
-                sigma_adj = max(sigma_adj, centroid_dist / 2.0)
-                log.info("[ensemble] %s/%s bimodal: inflating sigma_adj to %.2f",
-                         station_id, target_type, sigma_adj)
+                sigma_inflation_cap = get_param_float("regime.sigma_inflation_cap")
+                target_sigma = max(sigma_adj, centroid_dist / 2.0)
+                if target_sigma > sigma_inflation_cap:
+                    log.warning(
+                        "[ensemble] %s/%s bimodal: centroid_dist=%.1f → "
+                        "sigma_adj=%.2f exceeds cap=%.2f; clamping and "
+                        "suppressing pricing for this group",
+                        station_id, target_type, centroid_dist,
+                        target_sigma, sigma_inflation_cap,
+                    )
+                    sigma_adj = sigma_inflation_cap
+                    bimodal_suppress = True
+                else:
+                    sigma_adj = target_sigma
+                    log.info(
+                        "[ensemble] %s/%s bimodal: inflating sigma_adj to %.2f",
+                        station_id, target_type, sigma_adj,
+                    )
 
             # σ_eff
             sigma_eff = compute_sigma_eff(sigma_adj, s_weighted)

@@ -161,12 +161,22 @@ def main() -> None:
         
         # Step 8: fetch_market_prices (Required for accurate paper trades AND live trades)
         if client is not None:
-            try:
-                total_snapshots = _step8_fetch_market_prices(conn, client, pipeline_run_id)
-                log.info("Step 8 OK: %d orderbook snapshots", total_snapshots)
-            except Exception as e:
-                log.error("Step 8 ERROR: market price fetch failed: %s", e)
-                status = STATUS_PARTIAL
+            if _liquidity_gate_open(now_utc):
+                try:
+                    total_snapshots = _step8_fetch_market_prices(conn, client, pipeline_run_id)
+                    log.info("Step 8 OK: %d orderbook snapshots", total_snapshots)
+                except Exception as e:
+                    log.error("Step 8 ERROR: market price fetch failed: %s", e)
+                    status = STATUS_PARTIAL
+            else:
+                start_h = get_param_int("pipeline.market_hours_start_utc")
+                end_h = get_param_int("pipeline.market_hours_end_utc")
+                log.info(
+                    "Step 8 SKIPPED: outside liquidity window (now=%02d:%02dZ, "
+                    "window=%02d:00–%02d:00Z). Kalshi weather books are typically "
+                    "empty outside this range.",
+                    now_utc.hour, now_utc.minute, start_h, end_h,
+                )
 
         # Step 7.5: create_paper_positions (paper mode only)
         if not live_mode:
@@ -368,6 +378,20 @@ def main() -> None:
 # Step helpers
 # ─────────────────────────────────────────────────────────────────────
 
+def _liquidity_gate_open(now_utc: datetime) -> bool:
+    """True if the current UTC hour is inside the configured Kalshi weather
+    liquidity window. Outside it, Kalshi weather order books are usually empty
+    across every ticker, so fetching them just wastes API quota and creates
+    phantom "all markets illiquid" alerts.
+    """
+    if not get_param_bool("pipeline.liquidity_gate_enabled", default=True):
+        return True
+    start = get_param_int("pipeline.market_hours_start_utc")
+    end = get_param_int("pipeline.market_hours_end_utc")
+    h = now_utc.hour
+    return start <= h < end
+
+
 def _step8_fetch_market_prices(conn, client, run_id: str) -> int:
     """Fetch order books for active Shadow Book tickers."""
     import time as _time
@@ -481,7 +505,11 @@ def _step9_evaluate_gates_ibe(
     from kalshicast.execution.positions import get_remaining_capacity
     from kalshicast.collection.lead_time import compute_lead_hours, classify_lead_hours
 
-    # Get Shadow Book candidates with market prices
+    # Get Shadow Book candidates with market prices.
+    # Paper mode uses KALSHI_MARKETS cached yes_ask/last/yes_bid as a proxy for
+    # c_market. It previously fell back to 0.50 when all three were NULL — but
+    # that created phantom "edges" of 0.495 against a price that doesn't exist
+    # on any real order book. We now require at least one real price field.
     with conn.cursor() as cur:
         if paper_mode:
             cur.execute("""
@@ -489,13 +517,14 @@ def _step9_evaluate_gates_ibe(
                        sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN, sb.MU, sb.SIGMA_EFF,
                        sb.TOP_MODEL_ID,
                        COALESCE(km.YES_ASK / 100.0, km.LAST_PRICE / 100.0,
-                                km.YES_BID / 100.0, 0.50)
+                                km.YES_BID / 100.0)
                            AS C_VWAP_COMPUTED,
                        100 AS AVAILABLE_DEPTH
                 FROM SHADOW_BOOK sb
                 LEFT JOIN KALSHI_MARKETS km ON km.TICKER = sb.TICKER
                 WHERE sb.PIPELINE_RUN_ID = :run_id
                   AND sb.P_WIN IS NOT NULL
+                  AND COALESCE(km.YES_ASK, km.LAST_PRICE, km.YES_BID) IS NOT NULL
             """, {"run_id": pipeline_run_id})
         else:
             cur.execute("""
