@@ -403,6 +403,8 @@ def _step8_fetch_market_prices(conn, client, run_id: str) -> int:
     count = 0
     n_with_depth = 0
     n_empty = 0
+    sample_empty: dict[str, Any] | None = None
+    sample_with_depth: dict[str, Any] | None = None
     t_start = _time.monotonic()
 
     for ticker in tickers_to_fetch:
@@ -420,8 +422,26 @@ def _step8_fetch_market_prices(conn, client, run_id: str) -> int:
             count += 1
             if depth > 0 and c_vwap > 0:
                 n_with_depth += 1
+                if sample_with_depth is None:
+                    sample_with_depth = {
+                        "ticker": ticker,
+                        "c_vwap": round(c_vwap, 4),
+                        "depth": depth,
+                        "yes_levels": len(orderbook.get("yes", []) or []),
+                        "no_levels": len(orderbook.get("no", []) or []),
+                    }
             else:
                 n_empty += 1
+                if sample_empty is None:
+                    sample_empty = {
+                        "ticker": ticker,
+                        "c_vwap": round(c_vwap, 4),
+                        "depth": depth,
+                        "yes_levels": len(orderbook.get("yes", []) or []),
+                        "no_levels": len(orderbook.get("no", []) or []),
+                        "yes_first": (orderbook.get("yes") or [None])[0],
+                        "no_first": (orderbook.get("no") or [None])[0],
+                    }
         except Exception as e:
             log.warning("Orderbook fetch failed for %s: %s", ticker, e)
 
@@ -429,6 +449,13 @@ def _step8_fetch_market_prices(conn, client, run_id: str) -> int:
     log.info("[step8] fetched %d orderbooks in %.1fs: %d with depth, %d empty, "
              "%d skipped (previously empty)",
              count, elapsed, n_with_depth, n_empty, n_skipped)
+
+    # If every fetched book is empty, show one sample so we can tell a
+    # market-closed window from a parser/schema bug.
+    if count > 0 and n_with_depth == 0 and sample_empty is not None:
+        log.warning("[step8] all %d books empty — sample: %s", count, sample_empty)
+    elif sample_with_depth is not None:
+        log.debug("[step8] sample liquid book: %s", sample_with_depth)
 
     conn.commit()
     return count
@@ -621,6 +648,7 @@ def _step9_evaluate_gates_ibe(
         groups[key].append(c)
 
     best_bets = []
+    sizing_skip_reasons: dict[str, int] = defaultdict(int)
 
     for group_key, group_candidates in groups.items():
         parts = group_key.split("|")
@@ -727,9 +755,13 @@ def _step9_evaluate_gates_ibe(
                 bankroll=bankroll,
                 remaining_capacity=remaining,
                 c_market=cand["c_market"],
+                ticker=cand["ticker"],
             )
 
             selected = not sizing.get("skip", True) and sizing.get("contracts", 0) > 0
+
+            if sizing.get("skip"):
+                sizing_skip_reasons[sizing.get("reason", "unknown")] += 1
 
             bet = _make_best_bet(
                 cand, pipeline_run_id, selected=selected,
@@ -740,6 +772,7 @@ def _step9_evaluate_gates_ibe(
                 d_scale=sizing.get("d_scale", 1.0),
                 gamma=gamma,
                 contracts=sizing.get("contracts", 0),
+                sizing_reason=sizing.get("reason"),
             )
             best_bets.append(bet)
 
@@ -778,6 +811,12 @@ def _step9_evaluate_gates_ibe(
         n_all_gates_pass, n_kelly_positive, n_ibe_veto, n_selected,
         avg_edge, max_edge,
     )
+
+    if sizing_skip_reasons:
+        log.info(
+            "[gates] sizing-chain skip reasons: %s",
+            dict(sizing_skip_reasons),
+        )
 
     # Top 5 candidates by edge for diagnostics
     if candidates:
@@ -854,7 +893,29 @@ def _create_baseline_bets(conn: Any, pipeline_run_id: str, target_dates: list) -
         """, {"run_id": pipeline_run_id})
         rows = cur.fetchall()
 
+    # Coverage diagnostics: how many groups exist in SHADOW_BOOK total vs.
+    # how many survived the p_win > 0.20 filter?
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(DISTINCT STATION_ID || '|' || TARGET_DATE || '|' || TARGET_TYPE)
+            FROM SHADOW_BOOK
+            WHERE PIPELINE_RUN_ID = :run_id AND P_WIN IS NOT NULL
+        """, {"run_id": pipeline_run_id})
+        total_groups = int(cur.fetchone()[0] or 0)
+
+    groups_passing_filter = len({f"{r[1]}|{r[2]}|{r[3]}" for r in rows})
+
+    log.info(
+        "[baseline] shadow_book groups=%d, survived p_win>0.20=%d, "
+        "excluded=%d (all bins had p_win ≤ 0.20)",
+        total_groups, groups_passing_filter,
+        total_groups - groups_passing_filter,
+    )
+
     if not rows:
+        log.warning(
+            "[baseline] zero rows matched p_win>0.20 — no baseline bets placed"
+        )
         return []
 
     # Group by (station, date, type), pick highest p_win
@@ -869,6 +930,12 @@ def _create_baseline_bets(conn: Any, pipeline_run_id: str, target_dates: list) -
         ticker, sid, td, tt, bl, bu, p_win, c_market = best
         p_win_f = float(p_win)
         c_market_f = float(c_market)
+
+        log.debug(
+            "[baseline] %s %s %s → ticker=%s p_win=%.4f c_market=%.4f "
+            "(%d bins in group)",
+            sid, td, tt, ticker, p_win_f, c_market_f, len(group),
+        )
 
         bets.append({
             "ticker": ticker,
@@ -907,6 +974,7 @@ def _make_best_bet(
     d_scale: float = 1.0,
     gamma: float = 1.0,
     contracts: int = 0,
+    sizing_reason: str | None = None,
 ) -> dict:
     """Build a BEST_BETS row dict."""
     return {
@@ -932,6 +1000,7 @@ def _make_best_bet(
         "pipeline_run_status": "OK",
         "gate_flags": cand.get("gate_flags"),
         "contracts": contracts,
+        "sizing_reason": sizing_reason,
         # Pass through for order execution
         "s_tk": cand.get("s_tk"),
         "lead_hours": cand.get("lead_hours", 24.0),

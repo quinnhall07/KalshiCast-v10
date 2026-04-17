@@ -111,8 +111,14 @@ class TestPerCityFetch:
     def test_uses_correct_series_ticker_per_station(
         self, mock_conn, mock_client, patched_db
     ):
-        """series_ticker should be KX{HIGH|LOW}{kalshi_city}, honoring overrides."""
+        """series_ticker should come verbatim from station config.
+
+        The config mixes two prefix families (KXHIGH/KXLOW and KXHIGHT/KXLOWT)
+        because Kalshi uses different schemes for different cities. Every
+        configured series must be queried exactly as listed.
+        """
         from kalshicast.collection.kalshi_markets import sync_kalshi_markets
+        from kalshicast.config.stations import get_stations
 
         mock_client.get_events.return_value = []
 
@@ -123,14 +129,24 @@ class TestPerCityFetch:
             for _, kwargs in mock_client.get_events.call_args_list
         }
 
-        # Plain stations use cli_site
-        assert "KXHIGHNYC" in called_series
-        assert "KXLOWNYC" in called_series
-        # Overrides honored: KMDW → CHI, KLAX → LA
-        assert "KXHIGHCHI" in called_series
-        assert "KXLOWCHI" in called_series
-        assert "KXHIGHLA" in called_series
-        assert "KXLOWLA" in called_series
+        for station in get_stations(active_only=True):
+            if station.get("kalshi_high_series"):
+                assert station["kalshi_high_series"] in called_series, (
+                    f"{station['station_id']} HIGH "
+                    f"({station['kalshi_high_series']}) not queried"
+                )
+            if station.get("kalshi_low_series"):
+                assert station["kalshi_low_series"] in called_series, (
+                    f"{station['station_id']} LOW "
+                    f"({station['kalshi_low_series']}) not queried"
+                )
+
+        # Sanity: both prefix families are represented
+        assert any(s.startswith("KXHIGHT") for s in called_series)
+        assert any(
+            s.startswith("KXHIGH") and not s.startswith("KXHIGHT")
+            for s in called_series
+        )
 
     def test_passes_status_open_filter(
         self, mock_conn, mock_client, patched_db
@@ -151,13 +167,13 @@ class TestPerCityFetch:
         """If one (station, target) call raises, others must still proceed."""
         from kalshicast.collection.kalshi_markets import sync_kalshi_markets
 
-        ok_event = _make_event("KXHIGHLA-26APR16", ["B72"])
+        ok_event = _make_event("KXHIGHLAX-26APR16", ["B72"])
 
         def side_effect(*args, **kwargs):
             series = kwargs.get("series_ticker", "")
-            if series == "KXHIGHNYC":
+            if series == "KXHIGHNY":
                 raise RuntimeError("simulated 500")
-            if series == "KXHIGHLA":
+            if series == "KXHIGHLAX":
                 return [ok_event]
             return []
 
@@ -165,10 +181,10 @@ class TestPerCityFetch:
 
         result = sync_kalshi_markets(mock_conn, mock_client)
 
-        # One series failed, but the LA series still produced a synced market
+        # One series failed, but the LAX series still produced a synced market
         assert result.errors >= 1, "the failing series should be counted as an error"
         assert result.synced >= 1, (
-            "the OK series should still have produced upserts despite NYC failing"
+            "the OK series should still have produced upserts despite NY failing"
         )
 
 
@@ -252,13 +268,13 @@ class TestSyncedMarketShape:
     def test_high_event_creates_high_row_for_correct_station(
         self, mock_conn, mock_client, patched_db
     ):
-        """A KXHIGHNYC event under the NYC HIGH series → row with station=KNYC, type=HIGH."""
+        """A KXHIGHNY event under the NYC HIGH series → row with station=KNYC, type=HIGH."""
         from kalshicast.collection.kalshi_markets import sync_kalshi_markets
 
-        ok_event = _make_event("KXHIGHNYC-26APR16", ["B72", "B74"])
+        ok_event = _make_event("KXHIGHNY-26APR16", ["B72", "B74"])
 
         def side_effect(*args, **kwargs):
-            if kwargs.get("series_ticker") == "KXHIGHNYC":
+            if kwargs.get("series_ticker") == "KXHIGHNY":
                 return [ok_event]
             return []
 

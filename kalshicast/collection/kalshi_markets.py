@@ -223,8 +223,8 @@ def _sync_one_series(
     from kalshicast.db.connection import to_dt
     from kalshicast.db.operations import upsert_kalshi_market, is_event_ignored
 
-    series_prefix = "KXHIGH" if target_type == "HIGH" else "KXLOW"
     synced = ignored = errors = 0
+    n_markets_seen = 0
 
     try:
         events = client.get_events(
@@ -234,10 +234,12 @@ def _sync_one_series(
         )
     except Exception as e:
         log.warning(
-            "Kalshi: failed to fetch series %s for %s: %s",
-            series_ticker, station_id, e,
+            "[kalshi_sync] %s %s series=%s FETCH FAILED: %s",
+            station_id, target_type, series_ticker, e,
         )
         return SyncResult(synced=0, unmatched=0, ignored=0, errors=1)
+
+    n_events = len(events)
 
     def _maybe_dt(value):
         if value is None or value == "":
@@ -256,6 +258,7 @@ def _sync_one_series(
 
         markets = event.get("markets", []) or []
         market_title = event.get("title", "")
+        n_markets_seen += len(markets)
 
         # Pre-pass: collect all bin values to determine tail boundaries
         all_bins: list[tuple[float, bool]] = []
@@ -284,7 +287,7 @@ def _sync_one_series(
                 market_row = {
                     "ticker": ticker,
                     "event_ticker": event_ticker,
-                    "series_ticker": series_prefix,
+                    "series_ticker": series_ticker,
                     "station_id": station_id,
                     "target_date": target_date,
                     "target_type": target_type,
@@ -310,6 +313,13 @@ def _sync_one_series(
                 )
                 errors += 1
 
+    level = log.info if synced > 0 else log.warning
+    level(
+        "[kalshi_sync] %s %s series=%s events=%d markets_seen=%d synced=%d ignored=%d errors=%d",
+        station_id, target_type, series_ticker,
+        n_events, n_markets_seen, synced, ignored, errors,
+    )
+
     return SyncResult(synced=synced, unmatched=0, ignored=ignored, errors=errors)
 
 
@@ -327,22 +337,40 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
     being configured, a KALSHI_SYNC_EMPTY system alert is emitted (a strong
     signal of API change, network failure, or mis-configured series scheme).
     """
-    from kalshicast.config.stations import get_stations, get_kalshi_city
+    from kalshicast.config.stations import get_stations
     from kalshicast.db.operations import insert_system_alert
 
     synced = unmatched = ignored = errors = 0
     series_attempted = 0
     series_failed = 0
+    series_empty = 0
+    series_queried: list[str] = []
 
     stations = get_stations(active_only=True)
 
     for station in stations:
         station_id = station["station_id"]
-        kalshi_city = get_kalshi_city(station_id)
 
-        for target_type, series_prefix in (("HIGH", "KXHIGH"), ("LOW", "KXLOW")):
-            series_ticker = f"{series_prefix}{kalshi_city}"
+        # Use the series tickers configured per-station. These may use either
+        # the plain prefix (KXHIGH/KXLOW) or the "T" variant (KXHIGHT/KXLOWT),
+        # and the city portion is not always the cli_site (e.g. KMSY → NOLA,
+        # KLAS → LV, KDCA → DC). Reconstructing from a hardcoded prefix +
+        # cli_site silently fails for any station that doesn't match that
+        # convention — which is 13 of 20 today.
+        for target_type, config_key in (
+            ("HIGH", "kalshi_high_series"),
+            ("LOW", "kalshi_low_series"),
+        ):
+            series_ticker = station.get(config_key)
+            if not series_ticker:
+                log.warning(
+                    "[kalshi_sync] %s %s has no %s configured — skipping",
+                    station_id, target_type, config_key,
+                )
+                continue
+
             series_attempted += 1
+            series_queried.append(series_ticker)
 
             result = _sync_one_series(
                 conn, client, station_id, target_type, series_ticker,
@@ -350,23 +378,27 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
             synced += result.synced
             ignored += result.ignored
             errors += result.errors
-            if result.synced == 0 and result.errors > 0:
+            if result.errors > 0 and result.synced == 0:
                 series_failed += 1
+            elif result.synced == 0:
+                series_empty += 1
 
     conn.commit()
 
     log.info(
         "Kalshi sync complete: %d synced, %d unmatched, %d ignored, %d errors "
-        "(%d series queried, %d failed)",
-        synced, unmatched, ignored, errors, series_attempted, series_failed,
+        "(%d series queried, %d fetch-failed, %d returned zero markets)",
+        synced, unmatched, ignored, errors,
+        series_attempted, series_failed, series_empty,
     )
 
     # Sanity check: stations exist but nothing synced → structural failure
     if synced == 0 and len(stations) > 0:
         log.error(
             "Kalshi sync returned 0 markets across %d stations — "
-            "likely API change, network failure, or invalid series scheme",
-            len(stations),
+            "likely API change, network failure, or invalid series scheme. "
+            "Series queried: %s",
+            len(stations), series_queried,
         )
         try:
             insert_system_alert(conn, {
@@ -376,6 +408,8 @@ def sync_kalshi_markets(conn: Any, client: Any) -> SyncResult:
                     "n_stations": len(stations),
                     "series_attempted": series_attempted,
                     "series_failed": series_failed,
+                    "series_empty": series_empty,
+                    "series_queried": series_queried,
                     "errors": errors,
                 },
             })

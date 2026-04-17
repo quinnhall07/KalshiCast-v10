@@ -105,21 +105,35 @@ def compute_p_win(bin_lower: float, bin_upper: float,
 
 
 def normalize_probabilities(probs: list[float],
-                            p_min_floor: float | None = None) -> list[float]:
+                            p_min_floor: float | None = None,
+                            *,
+                            context: str | None = None) -> list[float]:
     """Normalize probabilities to sum to 1.0 if deviation > 1%.
 
-    Also re-applies floor.
+    Also re-applies floor. Optional ``context`` (e.g. ``"KNYC|2026-04-17|HIGH"``)
+    is echoed into the renormalization warning so systematic skew can be
+    tracked down to a specific station/date/type.
     """
     if p_min_floor is None:
         p_min_floor = get_param_float("pricing.p_min_floor")
 
+    tag = f"[shadow_book {context}]" if context else "[shadow_book]"
+
     total = sum(probs)
     if total <= 0:
         n = len(probs)
+        if n > 0:
+            log.warning(
+                "%s P(win) sum=%.4f ≤ 0 — falling back to uniform over %d bins",
+                tag, total, n,
+            )
         return [1.0 / n] * n if n > 0 else []
 
     if abs(total - 1.0) > 0.01:
-        log.warning("[shadow_book] P(win) sum=%.4f, renormalizing", total)
+        log.warning(
+            "%s P(win) sum=%.4f (dev=%.4f from 1.0), renormalizing over %d bins",
+            tag, total, total - 1.0, len(probs),
+        )
         probs = [p / total for p in probs]
 
     # Re-apply floor
@@ -234,7 +248,10 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
         probs = [compute_p_win(b["bin_lower"], b["bin_upper"], xi_s, omega_s, alpha_s) for b in bins]
 
         # Normalize
-        probs = normalize_probabilities(probs)
+        probs = normalize_probabilities(
+            probs,
+            context=f"{station_id}|{target_date}|{target_type}",
+        )
 
         # Apply METAR truncation
         bin_probs = [{"bin": b, "p_win": p} for b, p in zip(bins, probs)]
