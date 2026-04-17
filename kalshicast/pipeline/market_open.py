@@ -669,6 +669,15 @@ def _step9_evaluate_gates_ibe(
         row = cur.fetchone()
         mdd = float(row[0]) if row and row[0] else 0.0
 
+    # Kalman bias per (station, target_type) for IBE SCAS. Previously this was
+    # hardcoded to 0.0, so SCAS effectively measured |B_seasonal| instead of
+    # |B_seasonal − B_current|. That masked real seasonal drift signals.
+    kalman_b_cache: dict[str, float] = {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT STATION_ID, TARGET_TYPE, B_K FROM KALMAN_STATES")
+        for row in cur:
+            kalman_b_cache[f"{row[0]}|{row[1]}"] = float(row[2]) if row[2] is not None else 0.0
+
     # Group candidates by station/date/type for Smirnov Kelly
     from collections import defaultdict
     groups = defaultdict(list)
@@ -738,11 +747,21 @@ def _step9_evaluate_gates_ibe(
                 best_bets.append(_make_best_bet(cand, pipeline_run_id, selected=False))
                 continue
 
+            # Per-candidate BSS — lead_bracket can vary within a group (e.g.
+            # when a station has markets for "today's HIGH" and "tonight's
+            # LOW" close together). Previously this loop silently reused the
+            # last candidate's bss_info from the gate-evaluation loop.
+            cand_bracket = cand.get("lead_bracket", "h3")
+            cand_bss_info = bss_cache.get(
+                f"{sid}|{tt}|{cand_bracket}",
+                {"bss": None, "qualified": False},
+            )
+
             prev_sb = get_previous_shadow_book(conn, cand["ticker"])
             ibe_result = evaluate_ibe(conn, {
                 "station_id": sid,
                 "target_type": tt,
-                "lead_bracket": cand.get("lead_bracket", "h3"),
+                "lead_bracket": cand_bracket,
                 "target_date": td,
                 "p_win": cand["p_win"],
                 "p_previous": prev_sb["p_win"] if prev_sb else None,
@@ -752,7 +771,7 @@ def _step9_evaluate_gates_ibe(
                 "s_tk": ens["s_tk"],
                 "s_previous": None,
                 "sigma_hist": ens["sigma_eff"],
-                "b_k": 0.0,
+                "b_k": kalman_b_cache.get(f"{sid}|{tt}", 0.0),
             })
 
             insert_ibe_signal_log(conn, {
@@ -777,7 +796,7 @@ def _step9_evaluate_gates_ibe(
 
             sizing = full_sizing_chain(
                 f_star=f_star,
-                bss=bss_info["bss"] or 0.0,
+                bss=cand_bss_info["bss"] or 0.0,
                 ibe_composite=ibe_result["composite"],
                 gamma_scale=gamma_scale,
                 mdd=mdd,
@@ -805,10 +824,14 @@ def _step9_evaluate_gates_ibe(
             )
             best_bets.append(bet)
 
-        # Non-passing candidates
+        # Non-passing candidates in mixed-pass groups still need BEST_BETS
+        # rows so the dashboard / diagnostics see a full candidate picture.
+        # Previously this loop was a no-op (continue on match).
         for cand in group_candidates:
             if not cand.get("gate_pass"):
-                continue  # Already added above
+                best_bets.append(
+                    _make_best_bet(cand, pipeline_run_id, selected=False)
+                )
 
     # ── Diagnostic logging: candidate elimination funnel ─────────────
     n_candidates_total = len(candidates)
@@ -909,16 +932,20 @@ def _create_baseline_bets(conn: Any, pipeline_run_id: str, target_dates: list) -
     from collections import defaultdict
 
     with conn.cursor() as cur:
+        # Refuse the historical 0.50 fallback. A baseline bet priced at
+        # an invented 50¢ creates grading noise that poisons BSS for the
+        # cell. Require a real Kalshi price field.
         cur.execute("""
             SELECT sb.TICKER, sb.STATION_ID, sb.TARGET_DATE, sb.TARGET_TYPE,
                    sb.BIN_LOWER, sb.BIN_UPPER, sb.P_WIN,
                    COALESCE(km.YES_ASK / 100.0, km.LAST_PRICE / 100.0,
-                            km.YES_BID / 100.0, 0.50) AS C_MARKET
+                            km.YES_BID / 100.0) AS C_MARKET
             FROM SHADOW_BOOK sb
             LEFT JOIN KALSHI_MARKETS km ON km.TICKER = sb.TICKER
             WHERE sb.PIPELINE_RUN_ID = :run_id
               AND sb.P_WIN IS NOT NULL
               AND sb.P_WIN > 0.20
+              AND COALESCE(km.YES_ASK, km.LAST_PRICE, km.YES_BID) IS NOT NULL
         """, {"run_id": pipeline_run_id})
         rows = cur.fetchall()
 
@@ -1039,8 +1066,31 @@ def _make_best_bet(
 def _step11_update_health(conn: Any, target_dates: list[str],
                           total_ensemble: int, total_shadow: int,
                           total_bets: int) -> None:
-    """Update PIPELINE_DAY_HEALTH for each target date."""
+    """Update PIPELINE_DAY_HEALTH for each target date.
+
+    Uses per-date ENSEMBLE_STATE / BEST_BETS counts rather than pipeline
+    totals, so each row reflects the work actually done for that date
+    (previously every row received the 4-day sum, inflating the dashboard).
+    """
     for td in target_dates:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(DISTINCT STATION_ID)
+                FROM ENSEMBLE_STATE
+                WHERE TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD')
+            """, {"td": td})
+            row = cur.fetchone()
+            per_date_forecasted = int(row[0]) if row and row[0] else 0
+
+            cur.execute("""
+                SELECT COUNT(DISTINCT STATION_ID)
+                FROM BEST_BETS
+                WHERE TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD')
+                  AND IS_SELECTED_FOR_EXECUTION = 1
+            """, {"td": td})
+            row = cur.fetchone()
+            per_date_scored = int(row[0]) if row and row[0] else 0
+
         with conn.cursor() as cur:
             cur.execute("""
                 MERGE INTO PIPELINE_DAY_HEALTH tgt USING DUAL
@@ -1056,7 +1106,7 @@ def _step11_update_health(conn: Any, target_dates: list[str],
                     TO_DATE(:td, 'YYYY-MM-DD'), SYSTIMESTAMP, :sf, :ss,
                     CASE WHEN :sf > 0 THEN 1 ELSE 0 END
                 )
-            """, {"td": td, "sf": total_ensemble, "ss": total_bets})
+            """, {"td": td, "sf": per_date_forecasted, "ss": per_date_scored})
     conn.commit()
 
 

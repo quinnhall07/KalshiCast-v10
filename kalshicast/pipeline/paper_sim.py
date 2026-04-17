@@ -58,10 +58,21 @@ def create_paper_positions(conn: Any, pipeline_run_id: str) -> int:
         return 0
 
     count = 0
+    skipped_no_price = 0
     for row in candidates:
         ticker, sid, td, tt, bl, bu, price, f_final, order_type = row
 
-        price_f  = float(price   or 0.28)
+        # Skip rather than invent a price. An invented 28¢ contract feeds
+        # a fake entry cost into PnL and corrupts the BSS grading pipeline.
+        if price is None:
+            skipped_no_price += 1
+            log.warning(
+                "[paper_sim] %s has no contract_price; skipping paper position",
+                ticker,
+            )
+            continue
+
+        price_f  = float(price)
         ffinal_f = float(f_final or 0.01)
         contracts = max(1, int(ffinal_f * PAPER_BANKROLL / max(price_f, 0.01)))
 
@@ -92,7 +103,11 @@ def create_paper_positions(conn: Any, pipeline_run_id: str) -> int:
         count += 1
 
     conn.commit()
-    log.info("[paper_sim] created %d paper positions from run %s", count, pipeline_run_id[:8])
+    log.info(
+        "[paper_sim] created %d paper positions from run %s%s",
+        count, pipeline_run_id[:8],
+        f" (skipped {skipped_no_price} with no contract_price)" if skipped_no_price else "",
+    )
     return count
 
 
