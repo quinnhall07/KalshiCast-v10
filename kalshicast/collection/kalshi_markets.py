@@ -126,21 +126,31 @@ def extract_boundaries_from_market(
     Returns ``(bin_lower, bin_upper)`` with ``None`` for ±∞, or ``None`` if the
     payload lacks the fields. This is the preferred path — ticker-name parsing
     is only used when the payload doesn't carry strike fields.
+
+    Kalshi weather settlement uses integer °F observed at the CLI station, so
+    the integer ``floor``/``cap`` from the payload represents an inclusive
+    integer range. We widen each bound by 0.5°F so adjacent bins share a
+    boundary at X.5 — otherwise CDF(cap) − CDF(floor) loses the half-degree
+    "dead zone" between consecutive bins (e.g. 76↔77) and P(win) over all
+    bins sums to ~0.6 instead of ~1.0.
+
+    Example: a "75–76" bin (``strike_type=between, floor=75, cap=76``) means
+    integer HIGH ∈ {75, 76}, which maps to continuous ``[74.5, 76.5)``.
     """
     strike_type = (mkt.get("strike_type") or "").lower()
     floor = mkt.get("floor_strike")
     cap = mkt.get("cap_strike")
 
     if strike_type == "between" and floor is not None and cap is not None:
-        return (float(floor), float(cap))
+        return (float(floor) - 0.5, float(cap) + 0.5)
     if strike_type == "less" or (strike_type == "" and cap is not None and floor is None):
-        return (None, float(cap)) if cap is not None else None
+        return (None, float(cap) + 0.5) if cap is not None else None
     if strike_type in ("greater", "greater_or_equal") or (
         strike_type == "" and floor is not None and cap is None
     ):
-        return (float(floor), None) if floor is not None else None
+        return (float(floor) - 0.5, None) if floor is not None else None
     if floor is not None and cap is not None:
-        return (float(floor), float(cap))
+        return (float(floor) - 0.5, float(cap) + 0.5)
     return None
 
 
