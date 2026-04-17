@@ -107,12 +107,13 @@ def compute_p_win(bin_lower: float, bin_upper: float,
 def normalize_probabilities(probs: list[float],
                             p_min_floor: float | None = None,
                             *,
-                            context: str | None = None) -> list[float]:
-    """Normalize probabilities to sum to 1.0 if deviation > 1%.
+                            context: str | None = None,
+                            warn_threshold: float = 0.10) -> list[float]:
+    """Normalize probabilities to sum to 1.0 per spec §6.3/§6.4.
 
-    Also re-applies floor. Optional ``context`` (e.g. ``"KNYC|2026-04-17|HIGH"``)
-    is echoed into the renormalization warning so systematic skew can be
-    tracked down to a specific station/date/type.
+    Always renormalizes (never skips); deviations > ``warn_threshold`` (10%) are
+    surfaced as WARN-level log entries so systematic bin-coverage issues remain
+    diagnosable without blocking rows.
     """
     if p_min_floor is None:
         p_min_floor = get_param_float("pricing.p_min_floor")
@@ -129,22 +130,61 @@ def normalize_probabilities(probs: list[float],
             )
         return [1.0 / n] * n if n > 0 else []
 
-    if abs(total - 1.0) > 0.01:
+    if abs(total - 1.0) > warn_threshold:
         log.warning(
-            "%s P(win) sum=%.4f (dev=%.4f from 1.0), renormalizing over %d bins",
+            "%s P(win) sum=%.4f (dev=%+.4f from 1.0), renormalizing over %d bins",
             tag, total, total - 1.0, len(probs),
         )
+    if abs(total - 1.0) > 0.001:
         probs = [p / total for p in probs]
 
     # Re-apply floor
     probs = [max(p, p_min_floor) for p in probs]
 
-    # Final normalize
+    # Final normalize after flooring
     total = sum(probs)
     if total > 0 and abs(total - 1.0) > 0.001:
         probs = [p / total for p in probs]
 
     return probs
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Bimodal mixture-of-normals (spec §6.5)
+# ─────────────────────────────────────────────────────────────────────
+
+def compute_p_win_bimodal(
+    bin_lower: float, bin_upper: float,
+    mu1: float, mu2: float, sigma: float,
+    w1: float, w2: float,
+    p_min_floor: float | None = None,
+) -> float:
+    """P(win) under a two-component Gaussian mixture (spec §6.5).
+
+    Mixture CDF(x) = w1·Φ((x-μ1)/σ) + w2·Φ((x-μ2)/σ); the two components
+    share a single σ (taken from σ_eff) so width-of-centroid-split drives
+    multi-modality rather than one component swamping the other.
+
+    Handles ±∞ tails analogously to ``compute_p_win``.
+    """
+    from scipy.stats import norm
+
+    if p_min_floor is None:
+        p_min_floor = get_param_float("pricing.p_min_floor")
+
+    sigma = max(sigma, 0.01)
+
+    def _cdf(x: float) -> float:
+        return w1 * norm.cdf(x, loc=mu1, scale=sigma) + w2 * norm.cdf(x, loc=mu2, scale=sigma)
+
+    if math.isinf(bin_lower) and bin_lower < 0:
+        p = _cdf(bin_upper)
+    elif math.isinf(bin_upper) and bin_upper > 0:
+        p = 1.0 - _cdf(bin_lower)
+    else:
+        p = _cdf(bin_upper) - _cdf(bin_lower)
+
+    return max(p, p_min_floor)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -161,12 +201,13 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
     from kalshicast.pricing.bin_convention import generate_station_bins
     from kalshicast.pricing.truncation import apply_metar_truncation
     from kalshicast.processing.skewness import compute_skewness
+    from kalshicast.processing.regime import detect_bimodal
 
     # 1. Read all ensemble state for this run
     with conn.cursor() as cur:
         cur.execute("""
             SELECT STATION_ID, TARGET_DATE, TARGET_TYPE,
-                   F_TK_TOP, TOP_MODEL_ID, SIGMA_EFF, M_K
+                   F_TK_TOP, TOP_MODEL_ID, SIGMA_EFF, M_K, S_TK
             FROM ENSEMBLE_STATE
             WHERE RUN_ID = :run_id
         """, {"run_id": run_id})
@@ -176,6 +217,23 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
     if not ensemble_rows:
         log.warning("[shadow_book] no ensemble state for run %s", run_id)
         return 0
+
+    # Bulk-fetch per-source forecasts for this date so we can re-detect bimodal
+    # regime per (station, target_type) and route pricing through §6.5 when
+    # appropriate. Built once per run to avoid N queries inside the loop.
+    fc_by_group: dict[str, list[float]] = defaultdict(list)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT STATION_ID, TARGET_DATE, HIGH_F, LOW_F
+            FROM FORECASTS_DAILY
+            WHERE TARGET_DATE = TO_DATE(:td, 'YYYY-MM-DD')
+        """, {"td": target_date})
+        for row in cur:
+            sid, td, hi, lo = row[0], str(row[1])[:10], row[2], row[3]
+            if hi is not None:
+                fc_by_group[f"{sid}|{td}|HIGH"].append(float(hi))
+            if lo is not None:
+                fc_by_group[f"{sid}|{td}|LOW"].append(float(lo))
 
     # Build station_id → cli_site mapping for Kalshi ticker generation
     from kalshicast.config.stations import STATIONS as _ALL_STATIONS
@@ -209,19 +267,23 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
 
     sb_rows = []
     history_rows = []
-    n_skipped_mass_outside = 0
     n_skipped_no_bins = 0
     n_groups_processed = 0
+    n_mixture_priced = 0
 
-    pwin_sum_min = get_param_float("pricing.pwin_sum_min")
-    pwin_sum_max = get_param_float("pricing.pwin_sum_max")
+    n_missing_sigma = 0
 
     # 4. Process all rows in memory (Zero DB calls inside this loop!)
     for er in ensemble_rows:
         station_id = er["station_id"]
         target_type = er["target_type"]
         f_top = float(er["f_tk_top"]) if er.get("f_tk_top") is not None else None
-        sigma_eff = float(er["sigma_eff"]) if er.get("sigma_eff") is not None else 2.0
+        if er.get("sigma_eff") is None:
+            sigma_eff = 2.0
+            n_missing_sigma += 1
+        else:
+            sigma_eff = float(er["sigma_eff"])
+        s_tk = float(er["s_tk"]) if er.get("s_tk") is not None else 0.0
         top_model = er.get("top_model_id")
 
         if f_top is None:
@@ -239,11 +301,11 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
         err_vals = error_cache.get(err_key, [])
         g1_s = compute_skewness(err_vals)
 
-        # Convert to skew-normal params
+        # Convert to skew-normal params (always — used for METAR truncation
+        # even when the mixture path handles P(win))
         xi_s, omega_s, alpha_s = convert_to_skewnorm_params(mu, sigma_eff, g1_s)
 
         # Generate bins
-        # Look up Kalshi city code from station config
         _cli_site = station_cli_map.get(station_id)
         bins = get_kalshi_bins(conn, station_id, target_date, target_type)
 
@@ -253,31 +315,42 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
             n_skipped_no_bins += 1
             continue
 
-        # Compute P(win) for each bin
-        probs = [compute_p_win(b["bin_lower"], b["bin_upper"], xi_s, omega_s, alpha_s) for b in bins]
+        # Spec §6.5 mixture-of-normals when the forecast distribution is
+        # bimodal. Falls back to skew-normal when no bimodal signal or when
+        # the forecast set is too small (detect_bimodal needs ≥4 forecasts).
+        fc_list = fc_by_group.get(f"{station_id}|{target_date}|{target_type}", [])
+        bimodal = detect_bimodal(fc_list, s_tk) if fc_list else None
 
-        # Sanity check: total probability mass across Kalshi's listed bins.
-        # If the skew-normal places too much mass outside this range (or the
-        # Kalshi bin list is incomplete), forcibly renormalizing the remainder
-        # to 1.0 creates phantom edges. Skip pricing this group instead.
-        pre_norm_sum = sum(probs)
-        n_tails = sum(
-            1 for b in bins
-            if math.isinf(b["bin_lower"]) or math.isinf(b["bin_upper"])
-        )
-        if pre_norm_sum < pwin_sum_min or pre_norm_sum > pwin_sum_max:
-            log.warning(
-                "[shadow_book] skipping %s/%s/%s: P(win) sum=%.4f outside "
-                "[%.2f, %.2f] (bins=%d incl %d tails, mu=%.2f sigma_eff=%.2f) "
-                "— model mass doesn't fit Kalshi's bin range",
+        if bimodal is not None:
+            n1 = bimodal["cluster_size_1"]
+            n2 = bimodal["cluster_size_2"]
+            denom = n1 + n2
+            w1_mix = (n1 / denom) if denom else 0.5
+            w2_mix = 1.0 - w1_mix
+            mu1_corr = bimodal["centroid_1"] + b_k
+            mu2_corr = bimodal["centroid_2"] + b_k
+            probs = [
+                compute_p_win_bimodal(
+                    b["bin_lower"], b["bin_upper"],
+                    mu1_corr, mu2_corr, sigma_eff,
+                    w1_mix, w2_mix,
+                )
+                for b in bins
+            ]
+            n_mixture_priced += 1
+            log.debug(
+                "[shadow_book %s/%s/%s] mixture priced: c1=%.1f c2=%.1f "
+                "w=%.2f/%.2f σ=%.2f",
                 station_id, target_date, target_type,
-                pre_norm_sum, pwin_sum_min, pwin_sum_max,
-                len(bins), n_tails, mu, sigma_eff,
+                mu1_corr, mu2_corr, w1_mix, w2_mix, sigma_eff,
             )
-            n_skipped_mass_outside += 1
-            continue
+        else:
+            probs = [compute_p_win(b["bin_lower"], b["bin_upper"],
+                                   xi_s, omega_s, alpha_s) for b in bins]
 
-        # Normalize (residual deviation ≤ pwin_sum_{min,max})
+        # Spec §6.3: renormalize to 1.0 across listed bins. Large deviations
+        # are logged but no longer block the group — a 0.85 or 1.15 sum
+        # shrinks to 1.0 uniformly, which is preferable to dropping the bet.
         probs = normalize_probabilities(
             probs,
             context=f"{station_id}|{target_date}|{target_type}",
@@ -341,8 +414,10 @@ def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
     else:
         log.info(
             "[shadow_book] wrote %d rows for %s "
-            "(processed=%d, skipped_no_bins=%d, skipped_mass_outside=%d)",
+            "(processed=%d, skipped_no_bins=%d, mixture_priced=%d, "
+            "missing_sigma=%d)",
             wrote, target_date,
-            n_groups_processed, n_skipped_no_bins, n_skipped_mass_outside,
+            n_groups_processed, n_skipped_no_bins, n_mixture_priced,
+            n_missing_sigma,
         )
     return wrote
