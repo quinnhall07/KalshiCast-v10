@@ -1,8 +1,11 @@
 name: Morning Pipeline
 on:
   schedule:
-    - cron: '0 */4 * * *'  
+    - cron: '0 */4 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   WALLET_DIR: /home/runner/oracle_wallet

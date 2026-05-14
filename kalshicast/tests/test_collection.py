@@ -1,6 +1,11 @@
 """L1 Collection unit tests."""
 
 import pytest
+
+# These collectors import `requests` at module level. Skip the whole module
+# (rather than ImportError at collection time) when the dependency is missing.
+pytest.importorskip("requests")
+
 from kalshicast.collection.collectors.collect_metar import (
     _parse_temperature_f, _parse_dewpoint_f, _parse_wind,
 )

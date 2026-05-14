@@ -1,0 +1,9 @@
+# Maps personal email addresses in git history to GitHub no-reply addresses.
+# Replace <USERNAME>@users.noreply.github.com with each contributor's actual
+# GitHub username before public release.
+#
+# Format: Display Name <preferred-email> Old Name <old-email>
+
+Hunter Earls <hunter@users.noreply.github.com> Hunter Earls <hunter.earls.scho@gmail.com>
+Quinn Hall <quinnhall07@users.noreply.github.com> Quinn Hall <quinn.hall.scho@gmail.com>
+Vedant Garg <vedantgarg@users.noreply.github.com> Vedant Garg <vedantgarg119@gmail.com>

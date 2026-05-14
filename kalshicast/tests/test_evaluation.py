@@ -2,6 +2,12 @@
 
 import math
 import pytest
+
+# kalshicast.evaluation.calibration -> kalshicast.db.operations -> oracledb.
+# Skip the whole module (rather than ImportError at collection time) when
+# the optional Oracle driver is not installed in the runtime environment.
+pytest.importorskip("oracledb")
+
 from kalshicast.evaluation.calibration import (
     compute_bic, _generate_grid, get_calibration_candidates,
 )

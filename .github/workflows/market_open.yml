@@ -9,6 +9,9 @@ on:
         required: false
         default: 'false'
 
+permissions:
+  contents: read
+
 env:
   WALLET_DIR: /home/runner/oracle_wallet
 

@@ -2,7 +2,7 @@
 
 ## Version 10.0
 
-**March 2026 — Confidential Internal Document**
+**March 2026 — Architecture & design specification.**
 
 ---
 

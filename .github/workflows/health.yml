@@ -4,6 +4,9 @@ on:
     - cron: '*/30 * * * *'  # Every 30 minutes
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   WALLET_DIR: /home/runner/oracle_wallet
 

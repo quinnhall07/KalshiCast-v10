@@ -2,6 +2,9 @@ name: Kalshi API Diagnostic
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   diagnose:
     runs-on: ubuntu-latest
