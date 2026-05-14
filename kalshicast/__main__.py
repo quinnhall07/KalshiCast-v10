@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import sys
 
+from kalshicast.logging_config import setup_logging
+
 
 def main() -> None:
     args = sys.argv[1:]
@@ -20,8 +22,7 @@ def main() -> None:
         morning_main()
 
     elif cmd == "schema":
-        import logging
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+        setup_logging()
         from kalshicast.db.connection import init_db, get_conn, close_pool
         from kalshicast.db.schema import ensure_schema, seed_config_tables
 
@@ -58,9 +59,7 @@ def main() -> None:
         close_pool()
 
     elif cmd == "health":
-        import json
-        import logging
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+        setup_logging()
         from kalshicast.db.connection import init_db, get_conn, close_pool
         from kalshicast.pipeline.health import run_health_check
 
@@ -147,8 +146,7 @@ def main() -> None:
 
     elif cmd == "rollover":
         import json
-        import logging
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+        setup_logging()
         from kalshicast.db.connection import init_db, get_conn, close_pool
         from kalshicast.pipeline.rollover import run_rollover
 
@@ -163,8 +161,7 @@ def main() -> None:
 
     elif cmd == "calibrate":
         import json
-        import logging
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+        setup_logging()
         from kalshicast.db.connection import init_db, get_conn, close_pool
         from kalshicast.evaluation.calibration import run_calibration
 

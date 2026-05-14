@@ -218,7 +218,10 @@ def main() -> None:
                                 error_msg=error_msg)
             conn.commit()
         except Exception:
-            pass
+            # Best-effort crash bookkeeping: if recording the crash itself
+            # fails (e.g. DB unreachable), we still want to re-raise the
+            # original exception below. Log so it's not invisible.
+            log.exception("Failed to record night pipeline crash to DB")
         raise
     finally:
         conn.close()

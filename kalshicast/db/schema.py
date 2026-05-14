@@ -623,7 +623,9 @@ def ensure_schema(conn: Any) -> list[str]:
             with conn.cursor() as cur:
                 cur.execute(idx_sql)
         except Exception:
-            pass  # index already exists
+            # Index already exists (ORA-00955) is the expected case here;
+            # log at debug to keep this noise-free in normal operation.
+            log.debug("Index creation skipped (likely already exists): %s", idx_sql.split("\n", 1)[0])
 
     from kalshicast.db.migrations.add_backfill_flags import run_migrations as _run_backfill_flags
     _run_backfill_flags(conn)

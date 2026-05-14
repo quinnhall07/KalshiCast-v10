@@ -241,7 +241,10 @@ def execute_best_bets(
                         WHERE ORDER_ID = :oid
                     """, {"pid": position_id, "oid": result["order_id"]})
             except Exception:
-                pass
+                log.exception(
+                    "Failed to link ORDER_LOG.POSITION_ID for order_id=%s position_id=%s",
+                    result.get("order_id"), position_id,
+                )
 
         # Step 5: Write position
         if total_filled > 0:

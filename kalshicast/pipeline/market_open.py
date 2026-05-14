@@ -9,13 +9,12 @@ Live mode:  All 12 steps including API calls and order submission.
 
 from __future__ import annotations
 
-import json
 import logging
 import sys
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
-from kalshicast.config.params_bootstrap import get_param_int, get_param_float, get_param_bool
+from kalshicast.config.params_bootstrap import get_param_int, get_param_bool
 from kalshicast.db.connection import get_conn, close_pool
 from kalshicast.db.operations import (
     update_pipeline_run, upsert_best_bets, insert_orderbook_snapshot,
@@ -364,7 +363,10 @@ def main() -> None:
                                 error_msg=error_msg)
             conn.commit()
         except Exception:
-            pass
+            # Best-effort crash bookkeeping: if recording the crash itself
+            # fails (e.g. DB unreachable), we still want to re-raise the
+            # original exception below. Log so it's not invisible.
+            log.exception("Failed to record market_open pipeline crash to DB")
         raise
     finally:
         conn.close()
@@ -688,6 +690,13 @@ def _step9_evaluate_gates_ibe(
     best_bets = []
     sizing_skip_reasons: dict[str, int] = defaultdict(int)
 
+    # Per-group lead_hours/bracket cache. compute_lead_hours depends only on
+    # (station_tz, target_date, kind), all three of which are constant within
+    # a group, but was previously recomputed once per candidate (~5-10× per
+    # group). Compute once and reuse.
+    _now_iso = datetime.now(timezone.utc).isoformat()
+    lead_cache: dict[str, tuple[float, str]] = {}
+
     for group_key, group_candidates in groups.items():
         parts = group_key.split("|")
         sid, td, tt = parts[0], parts[1], parts[2]
@@ -695,16 +704,19 @@ def _step9_evaluate_gates_ibe(
         ens_key = group_key
         ens = ensemble_cache.get(ens_key, {"s_tk": 3.0, "f_bar": 0.0, "sigma_eff": 3.0})
 
-        # Evaluate gates for each candidate
-        for cand in group_candidates:
-            # Compute dynamic lead_hours from target_date + station timezone
-            _lead_hours = compute_lead_hours(
+        # Compute lead_hours/bracket once per group (cached by group_key)
+        if group_key not in lead_cache:
+            _lh = compute_lead_hours(
                 station_tz=tz_map.get(sid, "America/New_York"),
-                issued_at=datetime.now(timezone.utc).isoformat(),
+                issued_at=_now_iso,
                 target_date=td,
                 kind=tt.lower(),
             )
-            _lead_bracket = classify_lead_hours(_lead_hours)
+            lead_cache[group_key] = (_lh, classify_lead_hours(_lh))
+        _lead_hours, _lead_bracket = lead_cache[group_key]
+
+        # Evaluate gates for each candidate
+        for cand in group_candidates:
             cand["lead_hours"] = _lead_hours
             cand["lead_bracket"] = _lead_bracket
 

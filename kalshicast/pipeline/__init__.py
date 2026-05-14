@@ -44,7 +44,8 @@ def pipeline_init(run_type: str) -> tuple[str, dict[str, Any]]:
 
     Returns (pipeline_run_id, db_params).
     """
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+    from kalshicast.logging_config import setup_logging
+    setup_logging()
 
     init_db()
     conn = get_conn()

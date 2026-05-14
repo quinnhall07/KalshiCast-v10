@@ -277,7 +277,9 @@ def _sync_one_series(
                 v, t = parse_ticker_bin(mkt.get("ticker", ""))
                 all_bins.append((v, t))
             except Exception:
-                pass
+                # Malformed ticker is expected for some markets; skip silently
+                # but record at debug for diagnosability.
+                log.debug("parse_ticker_bin failed for ticker=%r", mkt.get("ticker", ""))
 
         for mkt in markets:
             try:

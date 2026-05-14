@@ -1,4 +1,21 @@
 # kalshicast/ml_v1/train.py
+"""ML-v1 training pipeline: per-station XGBoost + LightGBM error-correction
+models with a regularized blend.
+
+For each station and target type (HIGH/LOW) this module fits a chronologically
+split 60/20/20 train/val/test bootstrap, fits XGB and LGBM on the 60% slice
+using the immutable hyperparameters already produced by walk-forward CV in
+``tune.py`` (params.json), optimizes a blend weight on the 20% validation slice
+under a bracket-loss objective (heavy penalty above 1.5°F) plus an L2 anti-
+collapse term that pulls the weight toward 0.5, and reports MAE on the held-out
+20% test slice. Two sets of artifacts are written under
+``get_model_path(station, type, ext)``: backtest models trained on the 60%
+slice (``model_backtest.json``/``.txt``) so ``backtest.py`` never evaluates a
+model on data it saw, and production models retrained on 100% of the data with
+n_estimators scaled +10% (conservatively) plus a ``blend_{type}.json`` weight
+file for the inference pipeline. Module entry-point parallelizes the per-
+station job across 4 processes and surfaces any failures.
+"""
 from __future__ import annotations
 
 import os
@@ -18,6 +35,32 @@ from kalshicast.config.stations import get_stations
 log = logging.getLogger(__name__)
 
 def train_station_models(station_id, lat, lon):
+    """Fit XGB+LGBM error-correction models and a blend weight for one station.
+
+    Loads the chronologically-sorted bootstrap dataframe via
+    ``fetch_bootstrap_data``, splits it 60/20/20 into train/val/test, then for
+    each target type in {``HIGH``, ``LOW``}:
+
+    * Trains XGB and LGBM on the 60% slice using the immutable hyperparameters
+      from ``params.json`` (produced by walk-forward CV in ``tune.py``) — the
+      Phase-1 backtest artifacts are saved as ``model_backtest.{json,txt}``.
+    * Optimizes a single blend weight on the 20% validation slice under
+      ``bracket_loss + 10·(w-0.5)²`` (the L2 term prevents 100/0 collapse, the
+      bracket loss doubles the penalty on errors > 1.5°F).
+    * Reports true holdout MAE on the 20% test slice (never used for any
+      training decision).
+    * Retrains both learners on 100% of the data with n_estimators × 1.10 and
+      saves the production artifacts to ``get_model_path(...)`` plus a
+      ``blend_{type}.json`` weight file for the inference pipeline.
+
+    Skips a (station, type) pair if its ``params.json`` is missing. Returns
+    early (no error) when the bootstrap dataframe is empty.
+
+    Args:
+        station_id: ICAO-style station identifier (e.g. ``KSFO``).
+        lat: station latitude (degrees), forwarded to the bootstrap fetcher.
+        lon: station longitude (degrees), forwarded to the bootstrap fetcher.
+    """
     log.info(f"🚀 Compiling VERSION: {CURRENT_VERSION} | STATION: {station_id}")
     df = fetch_bootstrap_data(station_id, lat, lon)
     if df.empty: return

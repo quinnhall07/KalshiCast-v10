@@ -1,6 +1,13 @@
-"""Shadow Book generation — skew-normal pricing → P(win) per bin.
+"""Shadow-book pricing: converts posterior weather distributions into fair P(win)
+across the listed Kalshi temperature bins.
 
-Spec §6: (μ, σ_eff, G1_s) → (ξ, ω, α) → P(win) = CDF(b) - CDF(a).
+For each (station, target_date, target_type) group with ensemble state, this module
+moment-matches the (μ, σ_eff, G1_s) triple into skew-normal parameters
+(ξ, ω, α) per spec §6.1, then computes P(win) = CDF(upper) − CDF(lower) per bin
+(§6.3). When the per-source forecast set is bimodal (§6.5) the skew-normal is
+replaced by a two-component Gaussian mixture sharing σ_eff. Probabilities are
+renormalized to 1.0 across listed bins, floored to avoid log(0) in Kelly, and
+written to SHADOW_BOOK + SHADOW_BOOK_HISTORY after METAR truncation.
 """
 
 from __future__ import annotations
@@ -23,13 +30,25 @@ def convert_to_skewnorm_params(mu: float, sigma_eff: float,
                                 alpha_cap: float | None = None) -> tuple[float, float, float]:
     """Convert (μ, σ_eff, G1_s) → (ξ_s, ω_s, α_s) for scipy.stats.skewnorm.
 
+    Moment-matches the first three moments to scipy's skew-normal parameterization
+    (spec §6.1). Falls back to a plain normal when |G1_s| < 1e-6. α is clipped to
+    ±``alpha_cap`` and ω is floored at 0.01 so a degenerate input cannot crash the
+    downstream CDF.
+
     4-step conversion:
     1. δ from G1_s via moment-matching
     2. α (shape) = δ / √(1 - δ²), clipped
     3. ω (scale) = σ_eff / √(1 - 2δ²/π)
     4. ξ (location) = μ - ω × δ × √(2/π)
 
-    Returns (xi_s, omega_s, alpha_s).
+    Args:
+        mu: posterior mean of the forecast distribution (°F).
+        sigma_eff: effective posterior std-dev (°F).
+        g1_s: standardized third moment (skewness) of historical errors.
+        alpha_cap: optional override for the shape-parameter cap; defaults to
+            ``pricing.alpha_cap``.
+    Returns:
+        Tuple ``(xi_s, omega_s, alpha_s)`` ready to pass to ``scipy.stats.skewnorm``.
     """
     if alpha_cap is None:
         alpha_cap = get_param_float("pricing.alpha_cap")
@@ -80,10 +99,22 @@ def convert_to_skewnorm_params(mu: float, sigma_eff: float,
 def compute_p_win(bin_lower: float, bin_upper: float,
                   xi_s: float, omega_s: float, alpha_s: float,
                   p_min_floor: float | None = None) -> float:
-    """P(win) = skewnorm.cdf(upper) - skewnorm.cdf(lower).
+    """Compute P(win) for a single Kalshi bin under a skew-normal posterior.
 
-    Handles tail bins (lower=-inf or upper=+inf).
-    Floors at p_min_floor to prevent log(0) in Kelly.
+    Returns ``skewnorm.cdf(upper) − skewnorm.cdf(lower)``, using the survival
+    function for the upper tail to retain numerical precision. The result is
+    floored at ``p_min_floor`` so Kelly sizing downstream cannot take log(0).
+
+    Args:
+        bin_lower: lower edge of the bin (°F), may be ``-math.inf`` for the low tail.
+        bin_upper: upper edge of the bin (°F), may be ``+math.inf`` for the high tail.
+        xi_s: skew-normal location.
+        omega_s: skew-normal scale.
+        alpha_s: skew-normal shape.
+        p_min_floor: optional override for the probability floor; defaults to
+            ``pricing.p_min_floor``.
+    Returns:
+        Floored P(win) in ``[p_min_floor, 1.0]``.
     """
     from scipy.stats import skewnorm
 
@@ -109,11 +140,22 @@ def normalize_probabilities(probs: list[float],
                             *,
                             context: str | None = None,
                             warn_threshold: float = 0.10) -> list[float]:
-    """Normalize probabilities to sum to 1.0 per spec §6.3/§6.4.
+    """Renormalize a list of bin P(win) values to sum to 1.0 per spec §6.3/§6.4.
 
     Always renormalizes (never skips); deviations > ``warn_threshold`` (10%) are
     surfaced as WARN-level log entries so systematic bin-coverage issues remain
-    diagnosable without blocking rows.
+    diagnosable without blocking rows. A non-positive total falls back to a
+    uniform distribution. The floor is re-applied and a second normalization pass
+    runs so the returned list is both floored and exactly sums to 1.0.
+
+    Args:
+        probs: raw per-bin P(win) before normalization.
+        p_min_floor: optional override for the probability floor; defaults to
+            ``pricing.p_min_floor``.
+        context: optional tag (``station|date|type``) injected into log messages.
+        warn_threshold: absolute deviation from 1.0 above which a WARN is emitted.
+    Returns:
+        Probabilities (same length as input) summing to ~1.0, each ≥ ``p_min_floor``.
     """
     if p_min_floor is None:
         p_min_floor = get_param_float("pricing.p_min_floor")
@@ -159,13 +201,25 @@ def compute_p_win_bimodal(
     w1: float, w2: float,
     p_min_floor: float | None = None,
 ) -> float:
-    """P(win) under a two-component Gaussian mixture (spec §6.5).
+    """Compute P(win) under a two-component Gaussian mixture (spec §6.5).
 
     Mixture CDF(x) = w1·Φ((x-μ1)/σ) + w2·Φ((x-μ2)/σ); the two components
-    share a single σ (taken from σ_eff) so width-of-centroid-split drives
-    multi-modality rather than one component swamping the other.
+    share a single σ (taken from σ_eff) so the width-of-centroid-split drives
+    multi-modality rather than one component swamping the other. Handles ±∞
+    tails analogously to ``compute_p_win`` and floors the result at
+    ``p_min_floor``.
 
-    Handles ±∞ tails analogously to ``compute_p_win``.
+    Args:
+        bin_lower: lower bin edge (°F), may be ``-math.inf``.
+        bin_upper: upper bin edge (°F), may be ``+math.inf``.
+        mu1: centroid of the first cluster (°F, bias-corrected).
+        mu2: centroid of the second cluster (°F, bias-corrected).
+        sigma: shared scale for both components (clamped ≥ 0.01).
+        w1: weight of the first component (cluster-size fraction).
+        w2: weight of the second component; caller is expected to pass ``1 - w1``.
+        p_min_floor: optional override for the probability floor.
+    Returns:
+        Floored mixture P(win) for the bin.
     """
     from scipy.stats import norm
 
@@ -192,13 +246,28 @@ def compute_p_win_bimodal(
 # ─────────────────────────────────────────────────────────────────────
 
 def price_shadow_book(conn: Any, target_date: str, run_id: str) -> int:
-    """Generate Shadow Book for all (station, date, type) with ensemble state.
-    
-    Optimized for bulk DB fetching to prevent N+1 query latency.
+    """Generate the Shadow Book for every (station, date, type) with ensemble state.
+
+    Pulls ENSEMBLE_STATE, FORECASTS_DAILY, KALMAN_STATES and FORECAST_ERRORS up
+    front in bulk (avoids per-group N+1 queries), then for each row applies
+    Kalman bias correction, computes skewness from the rolling error window,
+    converts to skew-normal parameters, and prices each listed Kalshi bin. When
+    the per-source forecast set passes ``detect_bimodal``, pricing routes through
+    the §6.5 mixture-of-normals instead of the skew-normal. Probabilities are
+    renormalized and METAR-truncated before insertion. Writes SHADOW_BOOK
+    (upsert) and SHADOW_BOOK_HISTORY (append) and commits.
+
+    Args:
+        conn: oracledb-style connection used for cursors and the final commit.
+        target_date: ISO ``YYYY-MM-DD`` date the markets settle on.
+        run_id: pipeline run identifier used both as filter on ENSEMBLE_STATE
+            and as ``PIPELINE_RUN_ID`` on the written rows.
+    Returns:
+        Number of SHADOW_BOOK rows written (0 when no markets are listed yet —
+        Kalshi typically lists weather markets only 24–48h before expiry).
     """
     from collections import defaultdict
     from kalshicast.db.operations import upsert_shadow_book, insert_shadow_book_history
-    from kalshicast.pricing.bin_convention import generate_station_bins
     from kalshicast.pricing.truncation import apply_metar_truncation
     from kalshicast.processing.skewness import compute_skewness
     from kalshicast.processing.regime import detect_bimodal

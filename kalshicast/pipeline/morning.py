@@ -1,18 +1,30 @@
-"""Morning pipeline — L1 collection orchestrator.
+"""Morning pipeline — L1 forecast collection orchestrator.
 
-Collects forecasts from 9 sources across 20 stations, writes to Oracle.
-Ported from morning.py with retry/semaphore logic extracted to collector_harness.py.
+Runs once per day (default ~13:00 UTC, configurable via
+``pipeline.morning_utc_hour``) to ingest the next several days of weather
+forecasts from every enabled provider (NWS, Open-Meteo, ECMWF, GFS, etc.)
+for every active station. For each (station, source) pair the pipeline:
+
+1. Calls the provider's fetcher (via :mod:`collector_harness` retry/semaphore).
+2. Normalizes the payload into ``daily`` and ``hourly`` row dicts.
+3. Bulk-upserts into ``FORECASTS_DAILY`` and ``FORECASTS_HOURLY`` keyed by
+   a single shared ``issued_at`` truncated to the hour (so cross-source
+   comparisons in :mod:`night` line up cleanly).
+
+Produces: rows in ``FORECASTS_DAILY``, ``FORECASTS_HOURLY``, plus a
+``PIPELINE_RUNS`` row summarizing stations_ok / stations_fail / row counts,
+and ``SYSTEM_ALERTS`` rows on high failure rate or zero output. Returns
+nothing; status is reflected in the pipeline_run row.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import logging
-import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple
 
-from kalshicast.config import HEADERS, get_stations
+from kalshicast.config import get_stations
 from kalshicast.config.params_bootstrap import get_param_int
 from kalshicast.collection.sources_registry import load_fetchers_safe
 from kalshicast.collection.time_axis import truncate_issued_at_to_hour_z
@@ -32,17 +44,13 @@ from kalshicast.pipeline import pipeline_init, RUN_MORNING
 
 log = logging.getLogger(__name__)
 
-# Debug knobs (set via env)
-DEBUG_DUMP = os.getenv("DEBUG_DUMP", "0") == "1"
-DEBUG_SOURCE = os.getenv("DEBUG_SOURCE", "").strip()
-DEBUG_STATION = os.getenv("DEBUG_STATION", "").strip()
-
 
 # ─────────────────────────────────────────────────────────────────────
 # Payload normalization (preserved from original morning.py)
 # ─────────────────────────────────────────────────────────────────────
 
 def _require_str(d: dict, k: str) -> str:
+    """Return ``d[k]`` as a stripped non-empty string, else raise ``ValueError``."""
     v = d.get(k)
     if not isinstance(v, str) or not v.strip():
         raise ValueError(f"payload missing/invalid '{k}'")
@@ -50,6 +58,7 @@ def _require_str(d: dict, k: str) -> str:
 
 
 def _coerce_float(x: Any, *, field: str) -> float:
+    """Coerce ``x`` to a float; raise ``ValueError`` (mentioning ``field``) on failure."""
     if isinstance(x, (int, float)):
         return float(x)
     if isinstance(x, str):
@@ -60,6 +69,12 @@ def _coerce_float(x: Any, *, field: str) -> float:
 
 
 def _normalize_daily(payload: dict) -> List[Dict[str, Any]]:
+    """Extract daily high/low rows from a collector payload.
+
+    Drops any row with a missing/short ``target_date`` or non-numeric
+    ``high_f``/``low_f``. Returns a list of ``{target_date, high_f, low_f}``
+    dicts ready for ``bulk_upsert_forecasts_daily``.
+    """
     daily = payload.get("daily")
     if not isinstance(daily, list):
         raise ValueError("payload missing/invalid 'daily'")
@@ -82,6 +97,13 @@ def _normalize_daily(payload: dict) -> List[Dict[str, Any]]:
 
 
 def _normalize_hourly_arrays(payload: dict) -> List[Dict[str, Any]]:
+    """Convert a collector's parallel-array hourly block into per-hour row dicts.
+
+    Accepts either KalshiCast-canonical keys (``temperature_f``,
+    ``humidity_pct``, ...) or Open-Meteo native keys
+    (``temperature_2m``, ``relative_humidity_2m``, ...). All series are
+    truncated to the shortest length to guarantee row alignment.
+    """
     hourly = payload.get("hourly")
     if hourly is None:
         return []
@@ -135,6 +157,12 @@ def _normalize_hourly_arrays(payload: dict) -> List[Dict[str, Any]]:
 
 
 def _normalize_payload_strict(raw: Any) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Validate and split a collector payload.
+
+    Returns ``(issued_at, daily_rows, hourly_rows)``. Raises ``ValueError`` if
+    the top-level payload, ``issued_at``, or ``daily`` are missing/invalid.
+    ``hourly`` is optional.
+    """
     if not isinstance(raw, dict):
         raise ValueError(f"collector returned {type(raw)}; expected dict payload")
     issued_at = _require_str(raw, "issued_at")
@@ -148,6 +176,13 @@ def _normalize_payload_strict(raw: Any) -> Tuple[str, List[Dict[str, Any]], List
 # ─────────────────────────────────────────────────────────────────────
 
 def _fetch_one(st: dict, source_id: str, fetcher, provider_group: str):
+    """Fetch one (station, source) pair under the retry harness.
+
+    Worker function for the ThreadPoolExecutor — must not raise. Returns the
+    tuple ``(station_id, station_dict, source_id, daily_rows, hourly_rows,
+    err)`` where ``err`` is either ``None`` on success or the exception
+    instance to be logged by the main thread.
+    """
     station_id = st["station_id"]
     try:
         raw = call_with_retry(fetcher, st, source_id, provider_group)
@@ -166,6 +201,13 @@ def _fetch_one(st: dict, source_id: str, fetcher, provider_group: str):
 # ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    """Run one morning pipeline pass.
+
+    Orchestrates: pipeline_init → station upsert → concurrent
+    fetch/normalize/upsert across every (station, source) pair → status
+    rollup. No return value; final state is recorded in ``PIPELINE_RUNS``.
+    Re-raises any unhandled exception after recording a crash alert.
+    """
     pipeline_run_id, _ = pipeline_init(RUN_MORNING)
 
     stations = get_stations(active_only=True)
@@ -227,6 +269,14 @@ def main() -> None:
                     pg = SOURCES.get(source_id, {}).get("provider_group", "OTHER")
                     tasks.append(ex.submit(_fetch_one, st, source_id, fetcher, pg))
 
+            # Batch commits: previously committed per-task (1 commit per
+            # (station, source) result). With 20 stations × 9 sources that
+            # was up to 180 commits per run. We now commit every COMMIT_BATCH
+            # results plus a final commit at the end of the loop. Each task's
+            # bulk_upsert_* calls still atomically write their rows; the
+            # commit just publishes them.
+            COMMIT_BATCH = 50
+            tasks_since_commit = 0
             for fut in concurrent.futures.as_completed(tasks):
                 station_id, st, source_id, daily_rows, hourly_rows, err = fut.result()
 
@@ -304,7 +354,15 @@ def main() -> None:
                         wrote = bulk_upsert_forecasts_hourly(conn, hourly_batch)
                         total_hourly += int(wrote or 0)
 
-                # Single commit per (station, source) result
+                # Batched commit (was per-task before). Final flush after the
+                # loop guarantees nothing is left uncommitted.
+                tasks_since_commit += 1
+                if tasks_since_commit >= COMMIT_BATCH:
+                    conn.commit()
+                    tasks_since_commit = 0
+
+            # Flush remainder
+            if tasks_since_commit > 0:
                 conn.commit()
 
         # Detect high failure rate and alert
@@ -381,7 +439,10 @@ def main() -> None:
             )
             conn.commit()
         except Exception:
-            pass
+            # Best-effort crash bookkeeping: if recording the crash itself
+            # fails (e.g. DB unreachable), we still want to re-raise the
+            # original exception below. Log so it's not invisible.
+            log.exception("Failed to record morning pipeline crash to DB")
         raise
     finally:
         conn.close()
