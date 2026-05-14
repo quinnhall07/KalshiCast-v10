@@ -7,7 +7,7 @@ pipeline schedule adherence, METAR freshness, and critical alert status.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any
 
 from kalshicast.config.params_bootstrap import get_param_int, get_param_float

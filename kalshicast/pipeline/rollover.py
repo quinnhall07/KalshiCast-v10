@@ -10,8 +10,6 @@ import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
-from kalshicast.db.operations import new_run_id
-
 log = logging.getLogger(__name__)
 
 

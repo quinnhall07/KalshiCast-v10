@@ -6,7 +6,7 @@ Ported from etl_utils.py with added classify_lead_hours() from v10 spec.
 from __future__ import annotations
 
 from datetime import datetime, date, time, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
 from kalshicast.config.params_bootstrap import get_param_int, get_param_float

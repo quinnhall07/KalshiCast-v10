@@ -8,7 +8,7 @@ import numpy as np
 import xgboost as xgb
 import lightgbm as lgb
 import logging
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from scipy.optimize import minimize_scalar
 
 from kalshicast.ml_v1.config import get_model_path, FEATURES, CURRENT_VERSION, DATA_DIR
@@ -243,8 +243,6 @@ def run_stacked_backtest(station_id: str):
 
 def aggregate_backtest_results():
     """Combines all blend_weight.json files into a single master summary CSV."""
-    import glob
-    
     base_dir = os.path.join(DATA_DIR, "..", "models", CURRENT_VERSION)
     results = []
     

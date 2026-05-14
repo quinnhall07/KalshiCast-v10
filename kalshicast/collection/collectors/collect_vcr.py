@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from kalshicast.config import HEADERS
-from kalshicast.config.params_bootstrap import get_param_int, get_param_float
+from kalshicast.config.params_bootstrap import get_param_int
 from kalshicast.collection.collectors.base import to_float, backfill_daily_from_hourly_temps
 from kalshicast.collection.time_axis import (
     axis_start_end,

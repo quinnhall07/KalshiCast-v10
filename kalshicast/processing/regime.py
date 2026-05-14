@@ -7,8 +7,8 @@ Method: K-means(k=2), confirm if centroid distance > min_centroid_dist × S.
 from __future__ import annotations
 
 import logging
-import math
-from kalshicast.config.params_bootstrap import get_param_float, get_param_int
+
+from kalshicast.config.params_bootstrap import get_param_float
 
 log = logging.getLogger(__name__)
 

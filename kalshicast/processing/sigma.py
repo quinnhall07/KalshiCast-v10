@@ -9,7 +9,7 @@ import logging
 import math
 from typing import Any
 
-from kalshicast.config.params_bootstrap import get_param_int, get_param_float
+from kalshicast.config.params_bootstrap import get_param_int
 
 log = logging.getLogger(__name__)
 

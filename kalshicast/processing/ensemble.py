@@ -6,13 +6,12 @@ staleness decay, spread computation, sigma_eff assembly.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 from typing import Any
 
 from kalshicast.config.params_bootstrap import get_param_float, get_param_int
-from kalshicast.processing.sigma import compute_sigma_for_pricing, SIGMA_FLOOR
+from kalshicast.processing.sigma import SIGMA_FLOOR
 from kalshicast.processing.skewness import compute_skewness
 
 log = logging.getLogger(__name__)

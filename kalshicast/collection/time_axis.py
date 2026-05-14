@@ -5,7 +5,7 @@ Ported from utils/time_axis.py — import paths updated, logic unchanged.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Set, Tuple
 from zoneinfo import ZoneInfo
 

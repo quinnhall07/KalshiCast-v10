@@ -10,7 +10,6 @@ Every parameter from v10 spec Section 3 is listed here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 _DB_OVERRIDES: dict[str, str] = {}
 

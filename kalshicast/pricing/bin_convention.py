@@ -10,7 +10,6 @@ The city code comes from STATIONS.cli_site (e.g., NYC, MIA, MDW).
 
 from __future__ import annotations
 
-import math
 import re
 from datetime import datetime
 

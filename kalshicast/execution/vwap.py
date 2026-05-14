@@ -6,8 +6,6 @@ Spec §7.6: Volume-Weighted Average Price from order book depth.
 from __future__ import annotations
 
 import logging
-import math
-from typing import Any
 
 from kalshicast.config.params_bootstrap import get_param_float, get_param_int
 

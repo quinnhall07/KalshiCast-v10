@@ -14,7 +14,6 @@ from typing import Any
 import requests
 
 from kalshicast.config import HEADERS
-from kalshicast.config.params_bootstrap import get_param_int
 
 log = logging.getLogger(__name__)
 

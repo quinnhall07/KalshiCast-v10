@@ -7,9 +7,7 @@ plus full sizing chain (cap → Φ → IBE → Γ → position → D_scale → j
 from __future__ import annotations
 
 import logging
-import math
 import random
-from typing import Any
 
 from kalshicast.config.params_bootstrap import get_param_float
 

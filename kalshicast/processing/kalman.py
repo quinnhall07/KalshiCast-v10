@@ -7,9 +7,8 @@ Spec §5.6: predict → R_k → Q_k → K_k → update.
 from __future__ import annotations
 
 import logging
-import math
-from dataclasses import dataclass, field
-from datetime import date, timedelta
+from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 from kalshicast.config.params_bootstrap import get_param_float, get_param_int

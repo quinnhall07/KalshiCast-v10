@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import timezone
 from typing import Any
 
 from kalshicast.db.connection import GUID_EXPR, to_dt
@@ -1321,7 +1321,6 @@ def insert_system_alert(conn: Any, alert: dict) -> None:
 
 def upsert_kalshi_market(conn: Any, market: dict) -> None:
     """Upsert a single Kalshi market row."""
-    import json
     with conn.cursor() as cur:
         cur.execute("""
             MERGE /*+ NO_PARALLEL(tgt) */ INTO KALSHI_MARKETS tgt
@@ -1434,8 +1433,6 @@ def kalshi_alert_exists(conn: Any, event_ticker: str) -> bool:
 def create_unknown_station_alert(conn: Any, event_ticker: str,
                                   market_title: str, sample_ticker: str) -> None:
     """Create an alert for an unmatched Kalshi station."""
-    import json
-    import uuid
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO SYSTEM_ALERTS (

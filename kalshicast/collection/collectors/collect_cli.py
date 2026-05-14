@@ -12,7 +12,6 @@ import requests
 from zoneinfo import ZoneInfo
 
 from kalshicast.config import HEADERS
-from kalshicast.config.params_bootstrap import get_param_int, get_param_float
 from kalshicast.db.operations import (
     get_or_create_observation_run,
     upsert_observation,

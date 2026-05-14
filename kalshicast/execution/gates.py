@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-from typing import Any
 
 from kalshicast.config.params_bootstrap import get_param_float
 

@@ -6,14 +6,11 @@ walk-forward split, reject if BIC increases or performance degrades.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
-from datetime import datetime, timezone
 from typing import Any, Callable
 
-from kalshicast.config.params_bootstrap import PARAM_DEFS, get_param, get_param_float
-from kalshicast.db.operations import insert_system_alert
+from kalshicast.config.params_bootstrap import PARAM_DEFS, get_param
 
 log = logging.getLogger(__name__)
 
